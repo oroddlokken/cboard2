@@ -73,6 +73,15 @@ def _repo(root: Path, name: str) -> Repo:
     return Repo(path=root / name, name=name, dormant=False)
 
 
+def _worktree(root: Path, name: str, main: Repo) -> Repo:
+    return Repo(
+        path=root / name,
+        name=name,
+        dormant=False,
+        main_git_dir=main.path / ".git",
+    )
+
+
 def _graphql(*entries: tuple[str, str] | None) -> str:
     """Build a GraphQL response, using None for a repo that resolved to null."""
     data: dict[str, object] = {}
@@ -746,3 +755,53 @@ def test_a_failed_search_is_saved_as_unknown(tmp_path: Path) -> None:
 
     assert saved[0].prs_known is False
     assert dict(saved[0].prs) == {}
+
+
+def test_a_worktree_shares_its_repos_remote_reading(tmp_path: Path) -> None:
+    main = _repo(tmp_path, "one")
+    side = _worktree(tmp_path, "one-side", main)
+    answers = {
+        "remote": "https://github.com/acme/one.git\n",
+        "for-each-ref": f"main\t{LOCAL_SHA}\n",
+        "merge-base": None,  # local main does not contain the remote tip
+    }
+    git = FakeGit({main.path: answers, side.path: answers})
+    gh = FakeGh(
+        graphql=_graphql(("main", REMOTE_SHA)),
+        prs=json.dumps([_pr("acme/one", 7)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([main, side], NOW) is True
+
+    made = [(root, args[0]) for root, args in git.calls]
+    assert made.count((main.path, "remote")) == 1
+    assert made.count((main.path, "for-each-ref")) == 1
+    assert made.count((main.path, "merge-base")) == 1
+    assert [call for call in made if call[0] == side.path] == []
+    assert gh.calls[0][-1].count('name: "one"') == 1
+    for path in (main.path, side.path):
+        state = reader.cached(path)
+        assert state.slug == "acme/one"
+        assert [pr.number for pr in state.prs] == [7]
+        assert state.behind_default is True
+
+
+def test_a_worktree_without_its_repo_resolves_on_its_own(tmp_path: Path) -> None:
+    main = _repo(tmp_path, "one")
+    side = _worktree(tmp_path, "one-side", main)
+    git = FakeGit(
+        {
+            side.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "for-each-ref": f"main\t{REMOTE_SHA}\n",
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([side], NOW) is True
+
+    assert reader.cached(side.path).slug == "acme/one"
+    assert reader.cached(side.path).behind_default is False

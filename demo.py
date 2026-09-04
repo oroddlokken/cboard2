@@ -2,7 +2,7 @@
 
     uv run python demo.py
 
-Nothing here reads git or GitHub: the 40 rows are built in this file, so a
+Nothing here reads git or GitHub: the 45 rows are built in this file, so a
 screenshot shows the same repos on any machine and no private repo name reaches
 an image. Three module attributes in :mod:`cboard2.tui` would still reach the
 disk, and are replaced below for the run.
@@ -116,6 +116,7 @@ def _row(
     dormant: bool = False,
     polled_ago: float = 1.0,
     remote: RemoteState = UNKNOWN,
+    main_git_dir: Path | None = None,
 ) -> Row:
     """Build one row as if the pollers had read this repo ``ago`` seconds back."""
     dirty = staged + unstaged + untracked
@@ -138,12 +139,45 @@ def _row(
         upstream=None if branch is None else f"origin/{branch}",
         dirty_paths=dirty_paths or _paths(name, dirty),
         last_edit=now - ago,
+        main_git_dir=main_git_dir,
     )
     return Row(state=state, moved_at=now - ago, remote=remote)
 
 
 def _featured(now: float) -> list[Row]:
     """Return the repos worth putting at the top of a screenshot, one per state."""
+    orbit = _known(
+        "orbit-web",
+        prs=(
+            _pr(
+                412,
+                "Pricing table: three tiers and an annual toggle",
+                f"{_OWNER}/orbit-web",
+                ago=18 * MINUTE,
+                now=now,
+            ),
+        ),
+    )
+    api = _known(
+        "acme-api",
+        prs=(
+            _pr(
+                1180,
+                "Key rotation without a restart",
+                f"{_OWNER}/acme-api",
+                ago=3 * HOUR,
+                now=now,
+            ),
+            _pr(
+                1174,
+                "WIP: move the rate limiter to Redis",
+                f"{_OWNER}/acme-api",
+                ago=2 * DAY,
+                now=now,
+                draft=True,
+            ),
+        ),
+    )
     return [
         _row(
             "orbit-web",
@@ -163,18 +197,19 @@ def _featured(now: float) -> list[Row]:
                 "docs/pricing.md",
                 "src/pricing/.snapshot.tmp",
             ),
-            remote=_known(
-                "orbit-web",
-                prs=(
-                    _pr(
-                        412,
-                        "Pricing table: three tiers and an annual toggle",
-                        f"{_OWNER}/orbit-web",
-                        ago=18 * MINUTE,
-                        now=now,
-                    ),
-                ),
-            ),
+            remote=orbit,
+        ),
+        _row(
+            "hotfix-checkout",
+            now=now,
+            ago=12 * MINUTE,
+            branch="hotfix/checkout-500",
+            subject="Guard the checkout callback against an empty cart",
+            unstaged=1,
+            ahead=1,
+            dirty_paths=("src/checkout/callback.ts",),
+            main_git_dir=DEMO_ROOT / "orbit-web" / ".git",
+            remote=orbit,
         ),
         _row(
             "ledger-sync",
@@ -192,26 +227,39 @@ def _featured(now: float) -> list[Row]:
             ahead=1,
             behind=3,
             dirty_paths=("api/auth/keys.py",),
-            remote=_known(
-                "acme-api",
-                prs=(
-                    _pr(
-                        1180,
-                        "Key rotation without a restart",
-                        f"{_OWNER}/acme-api",
-                        ago=3 * HOUR,
-                        now=now,
-                    ),
-                    _pr(
-                        1174,
-                        "WIP: move the rate limiter to Redis",
-                        f"{_OWNER}/acme-api",
-                        ago=2 * DAY,
-                        now=now,
-                        draft=True,
-                    ),
-                ),
-            ),
+            remote=api,
+        ),
+        _row(
+            "key-rotation",
+            now=now,
+            ago=35 * MINUTE,
+            branch="feat/key-rotation",
+            subject="Rotate signing keys without dropping in-flight requests",
+            staged=1,
+            unstaged=2,
+            ahead=4,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "redis-limiter",
+            now=now,
+            ago=2 * DAY,
+            branch="spike/redis-limiter",
+            subject="Move the rate limiter behind a Redis token bucket",
+            untracked=3,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "perf-triage",
+            now=now,
+            ago=5 * HOUR,
+            branch="release/4.2",
+            subject="Profile the signing hot path under load",
+            behind=6,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
         ),
         _row(
             "pipeline-tools",
@@ -251,6 +299,18 @@ def _featured(now: float) -> list[Row]:
 
 def _rest(now: float) -> list[Row]:
     """Return the repos that fill the table past one screen."""
+    payments = _known(
+        "payments-core",
+        prs=(
+            _pr(
+                88,
+                "Idempotency keys on every refund path",
+                f"{_OWNER}/payments-core",
+                ago=40 * MINUTE,
+                now=now,
+            ),
+        ),
+    )
     return [
         _row(
             "payments-core",
@@ -260,18 +320,18 @@ def _rest(now: float) -> list[Row]:
             subject="Make the refund handler idempotent",
             unstaged=2,
             ahead=1,
-            remote=_known(
-                "payments-core",
-                prs=(
-                    _pr(
-                        88,
-                        "Idempotency keys on every refund path",
-                        f"{_OWNER}/payments-core",
-                        ago=40 * MINUTE,
-                        now=now,
-                    ),
-                ),
-            ),
+            remote=payments,
+        ),
+        _row(
+            "refund-backfill",
+            now=now,
+            ago=4 * HOUR,
+            branch="chore/refund-backfill",
+            subject="Replay the September refunds through the new handler",
+            unstaged=1,
+            untracked=2,
+            main_git_dir=DEMO_ROOT / "payments-core" / ".git",
+            remote=payments,
         ),
         _row(
             "auth-gateway",
@@ -593,7 +653,7 @@ def _rest(now: float) -> list[Row]:
 
 
 def demo_rows(now: float) -> list[Row]:
-    """Return all 40 invented repos, newest activity first."""
+    """Return all 45 invented repos, newest activity first."""
     rows = _featured(now) + _rest(now)
     return sorted(rows, key=lambda row: -row.active_at)
 
@@ -684,6 +744,7 @@ def _demo_config() -> Config:
         dormant_interval=4 * HOUR,
         remote=False,
         remote_interval=300.0,
+        worktrees=True,
     )
 
 

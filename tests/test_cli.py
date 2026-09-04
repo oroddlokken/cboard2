@@ -44,6 +44,7 @@ def _board(root: Path, *, remote: bool = False) -> Board:
         dormant_interval=4 * 3600.0,
         remote=remote,
         remote_interval=300.0,
+        worktrees=True,
     )
     return Board(config)
 
@@ -75,6 +76,7 @@ def _remote_board(
         dormant_interval=4 * 3600.0,
         remote=True,
         remote_interval=300.0,
+        worktrees=True,
     )
     reader = RemoteReader(
         300.0,
@@ -403,3 +405,24 @@ def test_a_pull_clears_behind_from_the_cache_alone(
 
     assert cold.read_remote() is True
     assert cold.refresh(now=NOW)[0].remote.behind_default is True
+
+
+def test_ls_and_json_name_the_repo_a_worktree_belongs_to(
+    git_repo: Path,
+    worktree: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    board = _board(git_repo.parent)
+
+    assert cmd_ls(board, None, now=_now()) == 0
+    printed = capsys.readouterr().out.splitlines()
+
+    assert [line for line in printed if line.startswith(f"  ⑂ {worktree.name}")]
+    assert [line for line in printed if line.startswith(git_repo.name)]
+
+    assert cmd_json(board, None, now=_now()) == 0
+    rows = {row["name"]: row for row in json.loads(capsys.readouterr().out)}
+
+    assert rows[worktree.name]["worktree_of"] == str(git_repo / ".git")
+    assert rows[worktree.name]["branch"] == "side"
+    assert rows[git_repo.name]["worktree_of"] is None

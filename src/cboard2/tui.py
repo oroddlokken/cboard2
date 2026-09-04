@@ -28,8 +28,10 @@ from textual.widgets import DataTable, Footer, Header, Static
 from textual.widgets.data_table import CellDoesNotExist, RowDoesNotExist
 
 from cboard2.activity import branches
+from cboard2.board import group_families
 from cboard2.config import config_path
 from cboard2.configwrite import toggled, write_dormant
+from cboard2.discovery import main_name
 from cboard2.pull import pull_default
 
 if TYPE_CHECKING:
@@ -98,12 +100,30 @@ def filter_rows(
 
 
 def sort_rows(rows: Sequence[Row], order: str) -> list[Row]:
-    """Return the rows in the named order, most interesting first."""
+    """Return the rows in the named order, most interesting first.
+
+    Every order ends in :func:`cboard2.board.group_families`, so a repo and its
+    worktrees paint as one block wherever the sort put them.
+    """
     if order == "name":
-        return sorted(rows, key=lambda row: row.state.name.lower())
+        return group_families(sorted(rows, key=_name_key))
     if order == "dirty":
-        return sorted(rows, key=lambda row: (-row.state.dirty, -row.active_at))
-    return sorted(rows, key=lambda row: -row.active_at)
+        return group_families(
+            sorted(rows, key=lambda row: (-row.state.dirty, -row.active_at)),
+        )
+    return group_families(sorted(rows, key=lambda row: -row.active_at))
+
+
+def _name_key(row: Row) -> tuple[str, int, str]:
+    """Sort a repo by name, with its worktrees directly under it.
+
+    Sorting a worktree by its own directory name scatters it away from the repo
+    it belongs to, which is the one row the user is comparing it against.
+    """
+    state = row.state
+    if state.main_git_dir is None:
+        return state.name.lower(), 0, ""
+    return main_name(state.main_git_dir).lower(), 1, state.name.lower()
 
 
 def relative(seconds: float) -> str:
@@ -255,7 +275,7 @@ def row_cells(row: Row, now: float) -> tuple[Text, ...]:
     exists = Path(state.path).exists()
     return (
         Text(
-            state.name if exists else f"✗ {state.name}",
+            state.row_label if exists else f"✗ {state.row_label.lstrip()}",
             style="" if exists else "strike dim",
         ),
         branch_text(row),
@@ -343,7 +363,7 @@ class DetailScreen(ModalScreen[None]):
         with VerticalScroll(id="detail"):
             yield Static(
                 Content.assemble(
-                    (state.name, "bold"),
+                    (state.label, "bold"),
                     "\n",
                     (str(state.path), "dim"),
                 ),

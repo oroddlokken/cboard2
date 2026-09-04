@@ -26,6 +26,7 @@ def _board(root: Path) -> Board:
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        worktrees=True,
     )
     return Board(config)
 
@@ -111,6 +112,7 @@ def test_read_remote_walks_the_roots_before_its_first_read(tmp_path: Path) -> No
         dormant_interval=4 * 3600.0,
         remote=True,
         remote_interval=300.0,
+        worktrees=True,
     )
     gh = _CountingGh()
     board = Board(config, remote=RemoteReader(gh=gh))
@@ -119,3 +121,15 @@ def test_read_remote_walks_the_roots_before_its_first_read(tmp_path: Path) -> No
 
     assert [repo.name for repo in board.repos] == ["alpha", "beta"]
     assert [args[0] for args in gh.calls] == ["api", "search"]
+
+
+def test_a_worktree_row_follows_the_repo_it_belongs_to(
+    git_repo: Path,
+    worktree: Path,
+) -> None:
+    (worktree / "loose.txt").write_text("newer than the repo\n", encoding="utf-8")
+
+    rows = _board(git_repo.parent).refresh()
+
+    assert [row.state.path for row in rows] == [git_repo, worktree]
+    assert rows[0].active_at < rows[1].active_at

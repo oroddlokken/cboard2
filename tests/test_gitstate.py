@@ -36,6 +36,15 @@ def _repo(path: Path, *, dormant: bool = False) -> Repo:
     return Repo(path=path, name=path.name, dormant=dormant)
 
 
+def _worktree(path: Path, main: Path) -> Repo:
+    return Repo(
+        path=path,
+        name=path.name,
+        dormant=False,
+        main_git_dir=main / ".git",
+    )
+
+
 def test_counts_staged_unstaged_and_untracked(git_repo: Path) -> None:
     (git_repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
     (git_repo / "staged.txt").write_text("new\n", encoding="utf-8")
@@ -200,3 +209,23 @@ def test_parses_initial_and_detached_markers() -> None:
     assert snap.head_sha is None
     assert snap.detached
     assert snap.branch is None
+
+
+def test_a_worktree_state_labels_the_repo_it_belongs_to(
+    git_repo: Path,
+    worktree: Path,
+) -> None:
+    state = Poller(INTERVAL).poll([_worktree(worktree, git_repo)])[0]
+
+    assert state.label == f"{git_repo.name} ⑂ {worktree.name}"
+    assert state.row_label == f"  ⑂ {worktree.name}"
+    assert state.name == worktree.name
+    assert state.branch == "side"
+    assert state.main_git_dir == git_repo / ".git"
+
+
+def test_a_clone_labels_itself(git_repo: Path) -> None:
+    state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
+
+    assert state.label == git_repo.name
+    assert state.row_label == git_repo.name

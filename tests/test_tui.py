@@ -12,7 +12,7 @@ import pytest
 from conftest import RecordingRunner, git
 from textual.widgets import DataTable, Footer, Header
 
-from cboard2.board import Board, Row
+from cboard2.board import Board, Row, group_families
 from cboard2.config import Config, load_config
 from cboard2.gitstate import Poller, RepoState
 from cboard2.pull import Outcome
@@ -49,6 +49,7 @@ def _config(root: Path, *, dormant: tuple[Path, ...] = ()) -> Config:
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        worktrees=True,
     )
 
 
@@ -65,6 +66,7 @@ def _row(
     dormant: bool = False,
     polled_at: float = 0.0,
     remote: RemoteState = UNKNOWN,
+    main_git_dir: Path | None = None,
 ) -> Row:
     state = RepoState(
         path=Path("/tmp") / name,  # noqa: S108 — never touched, only rendered
@@ -75,6 +77,7 @@ def _row(
         branch="main",
         unstaged=dirty,
         ahead=ahead,
+        main_git_dir=main_git_dir,
     )
     return Row(state=state, moved_at=active_at, remote=remote)
 
@@ -1151,3 +1154,43 @@ async def test_shift_p_on_an_empty_table_does_nothing(
         await pilot.pause()
 
     assert runs == []
+
+
+def test_name_order_puts_a_worktree_under_its_repo() -> None:
+    rows = [
+        _row("zulu"),
+        _row("side", main_git_dir=Path("/tmp/mid/.git")),  # noqa: S108 — rendered only
+        _row("alpha"),
+        _row("mid"),
+    ]
+
+    ordered = sort_rows(rows, "name")
+
+    assert [row.state.row_label for row in ordered] == [
+        "alpha",
+        "mid",
+        "  ⑂ side",
+        "zulu",
+    ]
+
+
+def test_every_order_keeps_a_repo_and_its_worktrees_together() -> None:
+    mid = Path("/tmp/mid/.git")  # noqa: S108 — rendered only, never opened
+    rows = [
+        _row("zulu", active_at=50.0, dirty=9),
+        _row("side", active_at=90.0, main_git_dir=mid),
+        _row("alpha", active_at=70.0),
+        _row("mid", active_at=10.0, dirty=1),
+    ]
+
+    for order in ("recent", "dirty", "name"):
+        ordered = sort_rows(rows, order)
+        names = [row.state.name for row in ordered]
+
+        assert names.index("side") == names.index("mid") + 1, order
+
+
+def test_grouping_leaves_a_worktree_whose_repo_is_filtered_out() -> None:
+    rows = [_row("side", main_git_dir=Path("/tmp/mid/.git"))]  # noqa: S108 — rendered
+
+    assert group_families(rows) == rows

@@ -92,6 +92,14 @@ def git_repo(empty_git_repo: Path) -> Path:
     return empty_git_repo
 
 
+@pytest.fixture
+def worktree(git_repo: Path) -> Path:
+    """Return a linked worktree of :fixture:`git_repo`, checked out on ``side``."""
+    tree = git_repo.parent / "side"
+    git(git_repo, "worktree", "add", "-q", "-b", "side", str(tree))
+    return tree
+
+
 class RecordingRunner:
     """A git runner that records every call and replays canned output.
 

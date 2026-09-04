@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import TYPE_CHECKING
+
+from conftest import git
 
 from cboard2.config import DEFAULT_MAX_DEPTH, Config
 from cboard2.discovery import discover
@@ -18,6 +21,7 @@ def _config(
     *,
     dormant: tuple[Path, ...] = (),
     max_depth: int = 4,
+    worktrees: bool = True,
 ) -> Config:
     return Config(
         roots=(tree,),
@@ -26,6 +30,7 @@ def _config(
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        worktrees=worktrees,
     )
 
 
@@ -117,6 +122,7 @@ def test_overlapping_roots_return_each_repo_once(
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        worktrees=True,
     )
 
     assert [found.path for found in discover(config)] == [repo]
@@ -127,3 +133,63 @@ def test_dot_directories_are_not_walked(tree: Path, make_repo: RepoFactory) -> N
     visible = make_repo("visible")
 
     assert [repo.path for repo in discover(_config(tree))] == [visible]
+
+
+def test_a_worktree_names_the_repo_it_belongs_to(
+    tree: Path,
+    git_repo: Path,
+    worktree: Path,
+) -> None:
+    found = {repo.path: repo for repo in discover(_config(tree))}
+
+    assert found[worktree].main_git_dir == git_repo / ".git"
+    assert found[git_repo].main_git_dir is None
+    assert found[worktree].family == found[git_repo].family
+
+
+def test_a_submodule_is_not_a_worktree(tree: Path, make_repo: RepoFactory) -> None:
+    make_repo("sub", gitfile=True)
+
+    (found,) = discover(_config(tree))
+
+    assert found.main_git_dir is None
+    assert found.family == found.path / ".git"
+
+
+def test_a_worktree_inside_its_repo_is_found(tree: Path, git_repo: Path) -> None:
+    inner = git_repo / ".worktrees" / "inner"
+    git(git_repo, "worktree", "add", "-q", "-b", "inner", str(inner))
+
+    found = discover(_config(tree))
+
+    assert [repo.path for repo in found] == [git_repo, inner]
+    assert found[1].main_git_dir == git_repo / ".git"
+
+
+def test_worktrees_off_leaves_the_walk_alone(tree: Path, git_repo: Path) -> None:
+    inner = git_repo / ".worktrees" / "inner"
+    git(git_repo, "worktree", "add", "-q", "-b", "inner", str(inner))
+
+    found = discover(_config(tree, worktrees=False))
+
+    assert [repo.path for repo in found] == [git_repo]
+
+
+def test_a_deleted_worktree_directory_is_dropped(tree: Path, git_repo: Path) -> None:
+    inner = git_repo / ".worktrees" / "gone"
+    git(git_repo, "worktree", "add", "-q", "-b", "gone", str(inner))
+    shutil.rmtree(inner)
+
+    assert [repo.path for repo in discover(_config(tree))] == [git_repo]
+
+
+def test_a_dormant_root_covers_its_worktrees(
+    tree: Path,
+    git_repo: Path,
+    worktree: Path,
+) -> None:
+    found = {
+        repo.path: repo.dormant for repo in discover(_config(tree, dormant=(tree,)))
+    }
+
+    assert found == {git_repo: True, worktree: True}

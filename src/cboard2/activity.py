@@ -18,13 +18,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cboard2.discovery import git_dir
 from cboard2.gitstate import run_git
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+    from pathlib import Path
 
     from cboard2.discovery import Repo
     from cboard2.gitstate import GitRunner
@@ -217,29 +218,6 @@ def last_fetch(root: Path) -> float | None:
 def log_mtime(root: Path) -> float | None:
     """Return the mtime of ``logs/HEAD``, or None when the repo has no reflog."""
     return _mtime(git_dir(root) / "logs" / "HEAD")
-
-
-def git_dir(root: Path) -> Path:
-    """Return the repo's git directory, following a ``.git`` file if there is one.
-
-    A submodule's ``.git`` is a file holding ``gitdir: <path>``, so its reflog
-    lives outside the working tree. Read here rather than through
-    ``git rev-parse`` to keep the mtime gate free of subprocesses.
-    """
-    marker = root / ".git"
-    try:
-        if marker.is_dir():
-            return marker
-        text = marker.read_text(encoding="utf-8")
-    except OSError:
-        return marker
-
-    _, _, target = text.partition("gitdir:")
-    pointer = target.strip()
-    if not pointer:
-        return marker
-    resolved = Path(pointer)
-    return resolved if resolved.is_absolute() else root / resolved
 
 
 def _mtime(path: Path) -> float | None:

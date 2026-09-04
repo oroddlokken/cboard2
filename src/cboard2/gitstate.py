@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from cboard2.discovery import main_name
 from cboard2.lastedit import newest_mtime
 
 if TYPE_CHECKING:
@@ -67,11 +68,40 @@ class RepoState:
     dirty_paths: tuple[str, ...] = ()
     last_edit: float | None = None
     last_edit_capped: bool = False
+    main_git_dir: Path | None = None
+    """The main repo's git directory when this row is a linked worktree."""
 
     @property
     def dirty(self) -> int:
         """Total changed entries: staged, unstaged and untracked together."""
         return self.staged + self.unstaged + self.untracked
+
+    @property
+    def label(self) -> str:
+        """The full name, which for a worktree names the repo it belongs to.
+
+        ``cboard2 ⑂ fix`` rather than ``fix``, for the places that show one repo
+        on its own and cannot lean on a neighbouring row for the context.
+        """
+        if self.main_git_dir is None:
+            return self.name
+        return f"{main_name(self.main_git_dir)} ⑂ {self.name}"
+
+    @property
+    def family(self) -> Path:
+        """The git directory this row shares with the repo's other worktrees."""
+        return self.main_git_dir or self.path / ".git"
+
+    @property
+    def row_label(self) -> str:
+        """The name as a table cell: a worktree is indented under its repo.
+
+        Every order paints a repo and its worktrees as one block, so the repo
+        name is on the row above and this one carries the worktree directory.
+        """
+        if self.main_git_dir is None:
+            return self.name
+        return f"  ⑂ {self.name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +239,7 @@ class Poller:
             dirty_paths=snap.dirty_paths,
             last_edit=edit.at,
             last_edit_capped=edit.capped,
+            main_git_dir=repo.main_git_dir,
         )
 
     def _head_meta(self, root: Path) -> tuple[str | None, int | None]:
@@ -245,6 +276,7 @@ def _unreadable(repo: Repo, moment: float) -> RepoState:
         dormant=repo.dormant,
         readable=False,
         polled_at=moment,
+        main_git_dir=repo.main_git_dir,
     )
 
 

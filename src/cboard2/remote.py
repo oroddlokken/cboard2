@@ -190,6 +190,24 @@ def run_gh(args: Sequence[str]) -> str | None:
     return result.stdout.strip() or None
 
 
+def leaders(repos: Sequence[Repo]) -> list[Repo]:
+    """Return one repo per family, in the order given.
+
+    A repo and its linked worktrees share ``refs``, so the origin URL and the
+    branch tips are one answer for the whole group. Reading them per row would
+    run the same git call once per worktree and put the same slug into the
+    query more than once.
+    """
+    seen: set[Path] = set()
+    chosen: list[Repo] = []
+    for repo in repos:
+        if repo.family in seen:
+            continue
+        seen.add(repo.family)
+        chosen.append(repo)
+    return chosen
+
+
 def parse_slug(url: str) -> str | None:
     """Return ``owner/name`` for a GitHub origin URL, or None for anything else."""
     match = _SLUG_PATTERN.search(url.strip())
@@ -459,8 +477,8 @@ class RemoteReader:
         for repo in known:
             state = self._states[repo.path]
             behind = self._behind(
-                repo.path,
-                heads.get(repo.path, {}),
+                repo,
+                heads.get(repo.family, {}),
                 state.default_branch,
                 state.default_sha,
             )
@@ -490,7 +508,7 @@ class RemoteReader:
 
     def _behind(
         self,
-        path: Path,
+        repo: Repo,
         heads: dict[str, str],
         branch: str | None,
         sha: str | None,
@@ -503,8 +521,9 @@ class RemoteReader:
         clone that fetched the commit without merging it, which a plain object
         lookup would not.
 
-        The answer is memoized on both shas, so a repo nobody has touched costs
-        no process on the next poll.
+        The answer is memoized per family on both shas, so a repo nobody has
+        touched costs no process on the next poll, and its worktrees cost none
+        either.
         """
         if branch is None or sha is None:
             return False
@@ -512,35 +531,42 @@ class RemoteReader:
         if local is None or local == sha:
             return False
 
-        key = (path, local, sha)
+        key = (repo.family, local, sha)
         contained = self._ancestry.get(key)
         if contained is None:
             contained = (
-                self._runner(path, ("merge-base", "--is-ancestor", sha, local))
+                self._runner(repo.path, ("merge-base", "--is-ancestor", sha, local))
                 is not None
             )
             self._ancestry[key] = contained
         return not contained
 
     def _slugs(self, repos: Sequence[Repo]) -> dict[Path, str]:
-        """Resolve each repo's origin to ``owner/name``, dropping the rest."""
+        """Resolve each family's origin to ``owner/name``, dropping the rest.
+
+        Answered per family and handed back per path, because the caller holds
+        one state per row.
+        """
 
         def slug(repo: Repo) -> tuple[Path, str | None]:
             out = self._runner(repo.path, _ORIGIN_ARGS)
-            return repo.path, None if out is None else parse_slug(out)
+            return repo.family, None if out is None else parse_slug(out)
 
-        return {
-            path: found for path, found in self._map(slug, repos) if found is not None
+        found = {
+            family: name
+            for family, name in self._map(slug, leaders(repos))
+            if name is not None
         }
+        return {repo.path: found[repo.family] for repo in repos if repo.family in found}
 
     def _heads(self, repos: Sequence[Repo]) -> dict[Path, dict[str, str]]:
-        """Read every repo's local branch tips."""
+        """Read the local branch tips once per family, keyed by family."""
 
         def heads(repo: Repo) -> tuple[Path, dict[str, str]]:
             out = self._runner(repo.path, _HEADS_ARGS)
-            return repo.path, {} if out is None else parse_heads(out)
+            return repo.family, {} if out is None else parse_heads(out)
 
-        return dict(self._map(heads, repos))
+        return dict(self._map(heads, leaders(repos)))
 
     def _defaults(self, slugs: Sequence[str]) -> dict[str, tuple[str, str]]:
         """Run the batched default-branch query and merge every chunk's answer."""
@@ -575,8 +601,10 @@ class RemoteReader:
 
     def forget_absent(self, repos: Iterable[Repo]) -> None:
         """Drop readings and memoized ancestry for repos off the watch list."""
-        live = {repo.path for repo in repos}
+        watched = list(repos)
+        live = {repo.path for repo in watched}
+        families = {repo.family for repo in watched}
         for path in [key for key in self._states if key not in live]:
             del self._states[path]
-        for key in [entry for entry in self._ancestry if entry[0] not in live]:
+        for key in [entry for entry in self._ancestry if entry[0] not in families]:
             del self._ancestry[key]

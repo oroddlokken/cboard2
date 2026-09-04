@@ -81,10 +81,18 @@ dormant = ["~/git/old-thing"]
 | `dormant_interval` | `4h` | How often a dormant repo is polled |
 | `remote` | `true` | Whether to ask GitHub anything at all |
 | `remote_interval` | `5m` | How often to ask |
+| `worktrees` | `true` | Whether a repo's linked worktrees get rows of their own |
 
 A dormant repo is still discovered, listed and readable. It is polled
 rarely, so a shelf of archived clones costs nothing per second. `CBOARD2_CONFIG`
 overrides the path.
+
+A linked worktree gets a row of its own, indented as `  ⑂ worktree`, including
+one kept inside its repo where the walk would never reach it. Every sort order
+paints a repo and its worktrees as one block, placed where the most interesting
+member of the group falls. The origin URL, the open PRs and the default branch
+are read once for a repo and shown on every one of its worktrees, since they
+share `refs`.
 
 ## Where the numbers come from
 

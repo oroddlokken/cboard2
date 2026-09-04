@@ -45,6 +45,13 @@ Set ``remote = false`` to keep cboard2 entirely off the network. Leaving it on
 costs nothing where ``gh`` is missing or unauthed: those repos read as unknown.
 """
 
+DEFAULT_WORKTREES = True
+"""Whether a repo's linked worktrees get rows of their own.
+
+A worktree has its own HEAD and its own dirty tree, so it is work the dashboard
+would otherwise hide. Set ``worktrees = false`` to see one row per clone.
+"""
+
 
 class ConfigError(Exception):
     """A config file was found, but one of its keys cannot be used."""
@@ -60,6 +67,7 @@ class Config:
     dormant_interval: float
     remote: bool
     remote_interval: float
+    worktrees: bool
 
 
 def config_path() -> Path:
@@ -84,6 +92,7 @@ def default_config() -> Config:
         dormant_interval=DEFAULT_DORMANT_INTERVAL,
         remote=DEFAULT_REMOTE,
         remote_interval=DEFAULT_REMOTE_INTERVAL,
+        worktrees=DEFAULT_WORKTREES,
     )
 
 
@@ -106,8 +115,9 @@ def load_config(path: Path | None = None) -> Config:
         max_depth=_depth(data),
         dormant=_paths(data, "dormant", ()),
         dormant_interval=_interval(data, "dormant_interval", DEFAULT_DORMANT_INTERVAL),
-        remote=_flag(data),
+        remote=_flag(data, "remote", fallback=DEFAULT_REMOTE),
         remote_interval=_interval(data, "remote_interval", DEFAULT_REMOTE_INTERVAL),
+        worktrees=_flag(data, "worktrees", fallback=DEFAULT_WORKTREES),
     )
 
 
@@ -136,11 +146,11 @@ def _depth(data: dict[str, object]) -> int:
     return value
 
 
-def _flag(data: dict[str, object]) -> bool:
-    """Read ``remote``, rejecting anything but a TOML boolean."""
-    value = data.get("remote", DEFAULT_REMOTE)
+def _flag(data: dict[str, object], key: str, *, fallback: bool) -> bool:
+    """Read a boolean key, rejecting anything but a TOML boolean."""
+    value = data.get(key, fallback)
     if not isinstance(value, bool):
-        msg = "remote must be true or false"
+        msg = f"{key} must be true or false"
         raise ConfigError(msg)
     return value
 

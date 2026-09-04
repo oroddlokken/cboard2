@@ -21,6 +21,9 @@ from cboard2.remotecache import load as load_cache
 from cboard2.remotecache import save as save_cache
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
     from cboard2.activity import Entry
     from cboard2.config import Config
     from cboard2.discovery import Repo
@@ -128,7 +131,7 @@ class Board:
             for state in states
         ]
         rows.sort(key=lambda row: row.active_at, reverse=True)
-        return rows
+        return group_families(rows)
 
     def _due_for_scan(self, moment: float) -> bool:
         """Return True on the first call, then once per :data:`RESCAN_INTERVAL`."""
@@ -172,6 +175,29 @@ class Board:
     ) -> list[Entry]:
         """Return the merged cross-repo activity feed, newest first."""
         return self._reader.feed(self._repos, since=since, limit=limit)
+
+
+def group_families(rows: Sequence[Row]) -> list[Row]:
+    """Reorder ``rows`` so a repo and its worktrees stay together.
+
+    The rows arrive in whatever order a sort left them. A family lands where
+    its best-placed member was, the repo leads it, and the worktrees keep the
+    order they had — a worktree row shows a directory name and nothing else, so
+    the repo has to be the row above it.
+    """
+    grouped: dict[Path, list[Row]] = {}
+    for row in rows:
+        grouped.setdefault(row.state.family, []).append(row)
+    return [row for group in grouped.values() for row in _repo_first(group)]
+
+
+def _repo_first(group: list[Row]) -> list[Row]:
+    """Put the repo above its worktrees, keeping the worktrees' own order."""
+    if len(group) == 1:
+        return group
+    repos = [row for row in group if row.state.main_git_dir is None]
+    worktrees = [row for row in group if row.state.main_git_dir is not None]
+    return repos + worktrees
 
 
 def _default_reader(config: Config) -> RemoteReader:

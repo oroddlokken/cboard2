@@ -148,6 +148,7 @@ def as_dict(row: Row) -> dict[str, object]:
     return {
         "path": str(state.path),
         "name": state.name,
+        "worktree_of": None if state.main_git_dir is None else str(state.main_git_dir),
         "dormant": state.dormant,
         "readable": state.readable,
         "branch": state.branch,
@@ -211,7 +212,7 @@ def format_table(rows: Sequence[Row], now: float, *, remote: bool = False) -> st
 def _cells(row: Row, now: float, *, remote: bool) -> tuple[str, ...]:
     """Return one row's cells, in the same order as the headers."""
     leading = (
-        row.state.name,
+        row.state.row_label,
         branch_text(row),
         head_text(row),
         state_text(row),
