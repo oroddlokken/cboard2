@@ -109,6 +109,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D103", "INP001"]  # tests are not an importable package
+# demo.py stands in for functions cboard2 calls, so its signatures carry
+# arguments it has no use for.
+"demo.py" = ["ARG001", "ARG002"]
 
 [tool.pyright]
 venvPath = "."
