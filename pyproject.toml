@@ -1,0 +1,134 @@
+[project]
+name = "cboard2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ove Ragnar Oddløkken", email = "post@rykroken.net" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "textual>=6.4.0",
+]
+
+[project.scripts]
+cboard2 = "cboard2.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cboard2"]
+
+# PEP 735 dependency groups — NOT [project.optional-dependencies]
+[dependency-groups]
+dev = [
+    "ruff>=0.15.0",
+    "vulture>=2.14",
+    "pyright>=1.1.408",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist[psutil]>=3.8.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-testmon>=2.2.0",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "A",     # flake8-builtins
+  "ARG",   # flake8-unused-arguments
+  "ASYNC", # flake8-async
+  "B",     # bugbear
+  "BLE",   # flake8-blind-except
+  "C4",    # flake8-comprehensions
+  "C90",   # McCabe complexity
+  "COM",   # flake8-commas
+  "D",     # pydocstyle
+  "DTZ",   # flake8-datetimez
+  "E",     # pycodestyle error
+  "EM",    # flake8-errmsg
+  "ERA",   # flake8-eradicate
+  "EXE",   # flake8-executable
+  "F",     # Pyflakes
+  "FA",    # flake8-future-annotations
+  "FBT",   # flake8-boolean-trap
+  "FLY",   # flynt
+  "FURB",  # refurb
+  "G",     # flake8-logging-format
+  "I",     # isort (ruff handles import sorting natively)
+  "ICN",   # flake8-import-conventions
+  "INP",   # flake8-no-pep420
+  "ISC",   # flake8-implicit-str-concat
+  "LOG",   # flake8-logging
+  "N",     # pep8-naming
+  "PERF",  # Perflint
+  "PIE",   # flake8-pie
+  "PL",    # Pylint (PLC, PLE, PLR, PLW)
+  "PT",    # flake8-pytest-style
+  "PTH",   # flake8-use-pathlib
+  "PYI",   # flake8-pyi
+  "Q",     # flake8-quotes
+  "RET",   # flake8-return
+  "RSE",   # flake8-raise
+  "RUF",   # Ruff-specific
+  "S",     # flake8-bandit (security)
+  "SIM",   # flake8-simplify
+  "SLF",   # flake8-self
+  "SLOT",  # flake8-slots
+  "T10",   # flake8-debugger
+  "T20",   # flake8-print
+  "TC",    # flake8-type-checking
+  "TID",   # flake8-tidy-imports
+  "TRY",   # tryceratops
+  "UP",    # pyupgrade
+  "W",     # pycodestyle warning
+  "YTT",   # flake8-2020
+]
+ignore = [
+  "COM812",  # trailing commas — conflicts with ruff formatter
+  "RUF100",  # unused blanket noqa directive
+  "EXE001",  # shebang present but file not executable
+  "D105",    # missing docstring in magic method
+  "D107",    # missing docstring in __init__
+  "D203",    # blank line before class docstring (conflicts with D211)
+  "D212",    # multi-line summary first line (conflicts with D213)
+  "D213",    # multi-line summary second line
+  "D413",    # missing blank line after last section
+  "D416",    # section name should end with colon
+  "S101",    # assert used — needed in tests, pyright handles production
+  "PLR0913", # too many arguments — not always avoidable
+  "PLR2004", # magic value comparison — too noisy for most projects
+  "C901",    # McCabe complexity — too rigid for real-world code
+  "G004",    # logging f-string — f-strings are fine in logging
+  "T201",    # print found — this is a CLI, stdout is the interface
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D103", "INP001"]  # tests are not an importable package
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+stubPath = "./typings"
+reportMissingTypeStubs = "none"   # too noisy for most projects
+reportPrivateUsage = "none"       # ruff SLF handles this
+reportUnusedFunction = "none"     # vulture handles this
+deprecateTypingAliases = true
+reportUnreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_mode = "strict"
+addopts = [
+    "--dist=worksteal",
+    "-p", "no:pastebin",
+    "-p", "no:nose",
+    "-p", "no:doctest",
+]

@@ -1,0 +1,1153 @@
+"""Tests for the dashboard, driven through Textual's pilot."""
+
+from __future__ import annotations
+
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+import pytest
+from conftest import RecordingRunner, git
+from textual.widgets import DataTable, Footer, Header
+
+from cboard2.board import Board, Row
+from cboard2.config import Config, load_config
+from cboard2.gitstate import Poller, RepoState
+from cboard2.pull import Outcome
+from cboard2.remote import UNKNOWN, PullRequest, RemoteState
+from cboard2.tui import (
+    _COLUMNS,
+    ActivityScreen,
+    CboardApp,
+    DetailScreen,
+    active_text,
+    cursor_key,
+    filter_rows,
+    pr_content,
+    pr_text,
+    relative,
+    remote_text,
+    sort_rows,
+)
+
+if TYPE_CHECKING:
+    from rich.text import Text
+    from textual.content import Content
+    from textual.notifications import SeverityLevel
+
+NEVER = 100_000.0
+"""A refresh interval long enough that only explicit polls fire."""
+
+
+def _config(root: Path, *, dormant: tuple[Path, ...] = ()) -> Config:
+    return Config(
+        roots=(root,),
+        max_depth=4,
+        dormant=dormant,
+        dormant_interval=4 * 3600.0,
+        remote=False,
+        remote_interval=300.0,
+    )
+
+
+def _board(root: Path, *, dormant: tuple[Path, ...] = ()) -> Board:
+    return Board(_config(root, dormant=dormant))
+
+
+def _row(
+    name: str,
+    *,
+    dirty: int = 0,
+    ahead: int = 0,
+    active_at: float = 0.0,
+    dormant: bool = False,
+    polled_at: float = 0.0,
+    remote: RemoteState = UNKNOWN,
+) -> Row:
+    state = RepoState(
+        path=Path("/tmp") / name,  # noqa: S108 — never touched, only rendered
+        name=name,
+        dormant=dormant,
+        readable=True,
+        polled_at=polled_at,
+        branch="main",
+        unstaged=dirty,
+        ahead=ahead,
+    )
+    return Row(state=state, moved_at=active_at, remote=remote)
+
+
+async def _settle(app: CboardApp) -> None:
+    """Wait for the poll worker so the table holds real readings."""
+    await app.workers.wait_for_complete()  # pyright: ignore[reportUnknownMemberType]
+
+
+def _table(app: CboardApp) -> DataTable[str | Text]:
+    """Return the repo table, typed so its cells are not Unknown."""
+    return cast("DataTable[str | Text]", app.query_one(DataTable))
+
+
+@pytest.mark.asyncio
+async def test_lists_every_repo_with_live_state(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+    app = CboardApp(_board(git_repo.parent), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        cells = [str(cell) for cell in table.get_row_at(0)]
+
+    assert table.row_count == 1
+    assert cells[0] == git_repo.name
+    assert cells[1] == "main"
+    assert "?1" in cells[4]
+    assert list((tmp_path / "cache").rglob("*")) == []
+
+
+@pytest.mark.asyncio
+async def test_dirty_filter_hides_clean_repos(git_repo: Path, tmp_path: Path) -> None:
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    git(clean, "init", "-b", "main", "-q")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        assert _table(app).row_count == 2
+
+        (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+        await pilot.press("r")
+        await _settle(app)
+        await pilot.press("d")
+        await pilot.pause()
+        table = _table(app)
+        remaining = table.row_count
+        names = [str(table.get_row_at(0)[0])]
+
+    assert remaining == 1
+    assert names == [git_repo.name]
+
+
+@pytest.mark.asyncio
+async def test_unpushed_filter_hides_repos_level_with_upstream(
+    git_repo: Path,
+) -> None:
+    app = CboardApp(_board(git_repo.parent), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.press("u")
+        await pilot.pause()
+        rows = _table(app).row_count
+
+    assert rows == 0
+
+
+@pytest.mark.asyncio
+async def test_an_external_commit_reaches_the_activity_feed(git_repo: Path) -> None:
+    app = CboardApp(_board(git_repo.parent), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        (git_repo / "tracked.txt").write_text("more\n", encoding="utf-8")
+        git(git_repo, "commit", "-qam", "Committed from another terminal")
+
+        await pilot.press("r")
+        await _settle(app)
+        await pilot.press("a")
+        await pilot.pause()
+
+        screen = app.screen
+        assert isinstance(screen, ActivityScreen)
+        feed = cast("DataTable[str]", screen.query_one(DataTable))
+        details = [str(feed.get_row_at(index)[3]) for index in range(feed.row_count)]
+
+    assert "Committed from another terminal" in details
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_repo_is_flagged_until_the_next_rescan(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    keeper = tmp_path / "keeper"
+    keeper.mkdir()
+    git(keeper, "init", "-b", "main", "-q")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        shutil.rmtree(git_repo)
+
+        # A plain poll stays inside the rescan interval, so the repo is still
+        # on the watch list and renders struck through rather than vanishing.
+        app.poll()
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        names = [str(table.get_row_at(index)[0]) for index in range(table.row_count)]
+
+    assert f"✗ {git_repo.name}" in names
+    assert keeper.name in names
+
+
+@pytest.mark.asyncio
+async def test_a_rescan_drops_a_deleted_repo(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    keeper = tmp_path / "keeper"
+    keeper.mkdir()
+    git(keeper, "init", "-b", "main", "-q")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        shutil.rmtree(git_repo)
+
+        await pilot.press("r")
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        names = [str(table.get_row_at(index)[0]) for index in range(table.row_count)]
+
+    assert names == [keeper.name]
+
+
+@pytest.mark.asyncio
+async def test_pressing_r_picks_up_a_new_clone(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        assert _table(app).row_count == 1
+
+        fresh = tmp_path / "fresh"
+        fresh.mkdir()
+        git(fresh, "init", "-b", "main", "-q")
+
+        await pilot.press("r")
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        names = {str(table.get_row_at(index)[0]) for index in range(table.row_count)}
+
+    assert names == {git_repo.name, "fresh"}
+
+
+@pytest.mark.asyncio
+async def test_shift_r_polls_a_dormant_repo_inside_its_window(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner({"status": "# branch.head main\n"})
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / ".git").mkdir()
+    board = Board(
+        _config(tmp_path, dormant=(old,)),
+        poller=Poller(4 * 3600.0, runner=runner),
+    )
+    app = CboardApp(board, refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        runner.calls.clear()
+
+        await pilot.press("r")
+        await _settle(app)
+        assert runner.paths_for("status") == []
+
+        await pilot.press("R")
+        await _settle(app)
+
+    assert runner.paths_for("status") == [old]
+
+
+def test_detail_screen_reports_files_branches_and_movements(git_repo: Path) -> None:
+    (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+    board = _board(git_repo.parent)
+    screen = DetailScreen(board.refresh()[0], board)
+    now = time.time()
+
+    assert "loose.txt" in screen.files_content().plain
+    assert "main" in screen.branches_content(now).plain
+    assert "Add tracked file" in screen.branches_content(now).plain
+    assert "commit" in screen.entries_content(now).plain
+
+
+def test_detail_screen_says_so_when_the_tree_is_clean(git_repo: Path) -> None:
+    board = _board(git_repo.parent)
+    screen = DetailScreen(board.refresh()[0], board)
+
+    assert "clean" in screen.files_content().plain
+
+
+@pytest.mark.asyncio
+async def test_the_cursor_stays_on_its_repo_across_a_poll(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-b", "main", "-q")
+    (other / "seed.txt").write_text("one\n", encoding="utf-8")
+    git(other, "add", "seed.txt")
+    git(other, "commit", "-qm", "Seed the other repo")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        table.move_cursor(row=1)
+        selected = cursor_key(table)
+
+        (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+        await pilot.press("r")
+        await _settle(app)
+        await pilot.pause()
+        after = cursor_key(_table(app))
+
+    assert selected is not None
+    assert after == selected
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_poll_does_not_repaint(git_repo: Path) -> None:
+    app = CboardApp(
+        _board(git_repo.parent),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        # A rebuild clears the table and mints fresh RowKey objects, so the
+        # identity of the existing key is what proves nothing was redrawn.
+        before = list(_table(app).rows)
+
+        app.render_rows()
+
+        assert next(iter(_table(app).rows)) is before[0]
+
+        (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+        await pilot.press("r")
+        await _settle(app)
+
+        assert next(iter(_table(app).rows)) is not before[0]
+
+        app.action_cycle_window()
+
+    assert app.sub_title.endswith("active <1h")
+
+
+@pytest.mark.asyncio
+async def test_filtering_out_the_selected_repo_does_not_raise(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    git(clean, "init", "-b", "main", "-q")
+    (git_repo / "loose.txt").write_text("new\n", encoding="utf-8")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        table = _table(app)
+        table.move_cursor(row=table.get_row_index(str(clean)))
+
+        await pilot.press("d")
+        await pilot.pause()
+        remaining = _table(app).row_count
+        landed = cursor_key(_table(app))
+
+    assert remaining == 1
+    assert landed == str(git_repo)
+
+
+def _keys(app: CboardApp) -> list[str | None]:
+    """Return the row keys in the order the table is showing them."""
+    return [key.value for key in _table(app).rows]
+
+
+@pytest.mark.asyncio
+async def test_a_recency_change_does_not_move_the_row(tmp_path: Path) -> None:
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+    beta = str(Path("/tmp/beta"))  # noqa: S108 — never touched, only keyed on
+    alpha = str(Path("/tmp/alpha"))  # noqa: S108
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("beta", active_at=100.0), _row("alpha", active_at=50.0)])
+        await pilot.pause()
+        assert _keys(app) == [beta, alpha]
+
+        # alpha is now the most recent, so a rebuild would put it first.
+        app.apply_rows(
+            [_row("beta", active_at=100.0), _row("alpha", active_at=1_799_999_940.0)],
+        )
+        await pilot.pause()
+        order = _keys(app)
+        table = _table(app)
+        alpha_active = str(table.get_row_at(1)[_COLUMNS.index("Active")])
+
+    assert order == [beta, alpha]
+    assert alpha_active == "1m ago"
+
+
+@pytest.mark.asyncio
+async def test_a_commit_updates_the_head_cell_in_place(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-b", "main", "-q")
+    (other / "seed.txt").write_text("one\n", encoding="utf-8")
+    git(other, "add", "seed.txt")
+    git(other, "commit", "-qm", "Seed the other repo")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        order = _keys(app)
+
+        (git_repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+        git(git_repo, "commit", "-qam", "Committed while the dashboard was open")
+        app.poll()
+        await _settle(app)
+        await pilot.pause()
+
+        table = _table(app)
+        heads = {
+            str(table.get_row_at(index)[0]): str(table.get_row_at(index)[2])
+            for index in range(table.row_count)
+        }
+        after = _keys(app)
+
+    assert after == order
+    assert heads[git_repo.name] == "Committed while the dashboard was open"
+    assert heads["other"] == "Seed the other repo"
+
+
+@pytest.mark.asyncio
+async def test_a_poll_leaves_the_scroll_offset_alone(tmp_path: Path) -> None:
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+    rows = [_row(f"repo{index:02d}", active_at=1000.0 - index) for index in range(40)]
+
+    async with app.run_test(size=(120, 12)) as pilot:
+        await _settle(app)
+        app.apply_rows(rows)
+        await pilot.pause()
+        table = _table(app)
+        table.scroll_to(y=8, animate=False)
+        await pilot.pause()
+        offset = table.scroll_offset
+
+        app.apply_rows(
+            [*rows[:5], _row("repo05", dirty=3, active_at=9000.0), *rows[6:]]
+        )
+        await pilot.pause()
+        after = _table(app).scroll_offset
+
+    assert offset.y > 0
+    assert after == offset
+
+
+@pytest.mark.asyncio
+async def test_a_repo_joining_the_visible_set_reorders(tmp_path: Path) -> None:
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+    rows = [_row("beta", active_at=100.0), _row("alpha", active_at=50.0)]
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(rows)
+        await pilot.pause()
+        assert _keys(app) == [str(Path("/tmp/beta")), str(Path("/tmp/alpha"))]  # noqa: S108
+
+        app.apply_rows([*rows, _row("gamma", active_at=500.0)])
+        await pilot.pause()
+        joined = _keys(app)
+
+    assert joined[0] == str(Path("/tmp/gamma"))  # noqa: S108
+
+
+@pytest.mark.asyncio
+async def test_pressing_s_reorders_the_rows(tmp_path: Path) -> None:
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("beta", active_at=100.0), _row("alpha", active_at=50.0)])
+        await pilot.pause()
+
+        await pilot.press("s")
+        await pilot.pause()
+        sorted_by_name = _keys(app)
+
+    assert app.sub_title.endswith("sort: name")
+    assert sorted_by_name == [str(Path("/tmp/alpha")), str(Path("/tmp/beta"))]  # noqa: S108
+
+
+class RecordingApp(CboardApp):
+    """The dashboard, with its notifications captured instead of shown.
+
+    Toasts do not mount under ``run_test()``, so overriding ``notify`` is the
+    only way to see what the app told the user.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        self.told: list[str] = []
+
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = True,
+    ) -> None:
+        """Record the message rather than raising a toast."""
+        self.told.append(message)
+        super().notify(
+            message,
+            title=title,
+            severity=severity,
+            timeout=timeout,
+            markup=markup,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pressing_shift_d_writes_the_repo_into_the_config(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "# keep me\nmax_depth = 1\ndormant = []\n",
+        encoding="utf-8",
+    )
+    app = RecordingApp(
+        _board(git_repo.parent),
+        refresh_interval=NEVER,
+        config_file=config_file,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        _table(app).move_cursor(row=0)
+
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.pause()
+        written = config_file.read_text(encoding="utf-8")
+        told = list(app.told)
+        rows = _table(app).row_count
+
+    assert "# keep me" in written
+    assert str(git_repo) in written or git_repo.name in written
+    assert load_config(config_file).dormant == (git_repo,)
+    assert app._board.config.dormant == (git_repo,)  # noqa: SLF001
+    assert rows == 1
+    assert any("dormant" in line for line in told)
+
+
+@pytest.mark.asyncio
+async def test_pressing_shift_d_twice_wakes_the_repo(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.toml"
+    original = "max_depth = 1\ndormant = []\n"
+    config_file.write_text(original, encoding="utf-8")
+    app = CboardApp(
+        _board(git_repo.parent),
+        refresh_interval=NEVER,
+        config_file=config_file,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        _table(app).move_cursor(row=0)
+
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.pause()
+
+    assert config_file.read_text(encoding="utf-8") == original
+    assert load_config(config_file).dormant == ()
+
+
+@pytest.mark.asyncio
+async def test_a_repo_toggled_dormant_is_skipped_by_the_next_poll(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "shelf"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    runner = RecordingRunner({"status": "# branch.head main\n"})
+    board = Board(_config(tmp_path), poller=Poller(4 * 3600.0, runner=runner))
+    config_file = tmp_path / "config.toml"
+    app = CboardApp(board, refresh_interval=NEVER, config_file=config_file)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        _table(app).move_cursor(row=0)
+        runner.calls.clear()
+
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.pause()
+        polled = runner.paths_for("status")
+        rows = _table(app).row_count
+
+    assert load_config(config_file).dormant == (repo,)
+    assert polled == []
+    assert rows == 1
+
+
+@pytest.mark.asyncio
+async def test_the_toggle_does_not_reorder_the_rows(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-b", "main", "-q")
+    config_file = tmp_path / "config.toml"
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        config_file=config_file,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        order = _keys(app)
+        _table(app).move_cursor(row=1)
+
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.pause()
+        after = _keys(app)
+
+    assert after == order
+    assert set(after) == {str(git_repo), str(other)}
+
+
+@pytest.mark.asyncio
+async def test_an_unwritable_config_notifies_instead_of_raising(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    app = RecordingApp(
+        _board(git_repo.parent),
+        refresh_interval=NEVER,
+        config_file=blocker / "config.toml",
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.pause()
+        _table(app).move_cursor(row=0)
+
+        await pilot.press("D")
+        await _settle(app)
+        await pilot.pause()
+        told = list(app.told)
+
+    assert any("could not write" in line for line in told)
+    assert app._board.config.dormant == ()  # noqa: SLF001
+
+
+def test_dirty_filter_keeps_only_dirty_rows() -> None:
+    rows = [_row("clean"), _row("messy", dirty=3)]
+
+    assert [row.state.name for row in filter_rows(rows, dirty_only=True)] == ["messy"]
+
+
+def test_unpushed_filter_keeps_only_rows_ahead() -> None:
+    rows = [_row("level"), _row("ahead", ahead=2)]
+
+    assert [row.state.name for row in filter_rows(rows, unpushed_only=True)] == [
+        "ahead"
+    ]
+
+
+def test_since_filter_drops_older_rows() -> None:
+    rows = [_row("old", active_at=100.0), _row("new", active_at=500.0)]
+
+    assert [row.state.name for row in filter_rows(rows, since=200.0)] == ["new"]
+
+
+def test_sorts_by_recent_name_and_dirty() -> None:
+    rows = [
+        _row("beta", active_at=100.0, dirty=5),
+        _row("alpha", active_at=500.0, dirty=1),
+    ]
+
+    assert [row.state.name for row in sort_rows(rows, "recent")] == ["alpha", "beta"]
+    assert [row.state.name for row in sort_rows(rows, "name")] == ["alpha", "beta"]
+    assert [row.state.name for row in sort_rows(rows, "dirty")] == ["beta", "alpha"]
+
+
+def test_dormant_row_shows_the_age_of_its_reading() -> None:
+    now = 100_000.0
+    dormant = _row("old", active_at=now - 60, dormant=True, polled_at=now - 7200)
+    live = _row("live", active_at=now - 60, polled_at=now)
+
+    assert active_text(dormant, now).plain == "1m ago (read 2h ago)"
+    assert active_text(live, now).plain == "1m ago"
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0.0, "just now"), (42.0, "42s ago"), (300.0, "5m ago"), (172800.0, "2d ago")],
+)
+def test_relative_renders_an_age(seconds: float, expected: str) -> None:
+    assert relative(seconds) == expected
+
+
+def _record_notes(
+    app: CboardApp,
+    notes: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collect the app's notifications instead of showing them."""
+
+    def note(message: object, **_kwargs: object) -> None:
+        notes.append(str(message))
+
+    monkeypatch.setattr(app, "notify", note)
+
+
+def _record_severities(
+    app: CboardApp,
+    severities: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collect the severity of each notification the app raises."""
+
+    def note(_message: object, **kwargs: object) -> None:
+        severities.append(str(kwargs.get("severity", "information")))
+
+    monkeypatch.setattr(app, "notify", note)
+
+
+def _styles(content: Content) -> list[tuple[str, str]]:
+    """Return each styled run as its text and its style, in document order."""
+    return [
+        (content.plain[span.start : span.end], str(span.style))
+        for span in content.spans
+    ]
+
+
+def _pr(number: int, *, draft: bool = False) -> PullRequest:
+    return PullRequest(
+        number=number,
+        title=f"Change {number}",
+        url=f"https://github.com/acme/repo/pull/{number}",
+        draft=draft,
+        updated_at=1_799_999_940.0,
+    )
+
+
+BEHIND = RemoteState(
+    slug="acme/repo",
+    default_branch="main",
+    default_sha="f" * 40,
+    behind_default=True,
+    default_known=True,
+    prs_known=True,
+)
+CURRENT = RemoteState(
+    slug="acme/repo",
+    default_branch="main",
+    default_sha="f" * 40,
+    default_known=True,
+    prs_known=True,
+)
+
+
+def test_remote_column_separates_behind_current_and_unknown() -> None:
+    assert remote_text(_row("a", remote=BEHIND)).plain == "behind main"
+    assert remote_text(_row("b", remote=CURRENT)).plain == "—"
+    assert remote_text(_row("c")).plain == "?"
+
+
+def test_pr_column_counts_drafts_apart() -> None:
+    two = RemoteState(prs_known=True, prs=(_pr(9, draft=True), _pr(7)))
+    three = RemoteState(
+        prs_known=True,
+        prs=(_pr(9, draft=True), _pr(8, draft=True), _pr(7)),
+    )
+    plain = RemoteState(prs_known=True, prs=(_pr(7),))
+
+    assert pr_text(_row("a", remote=two)).plain == "2 (1 draft)"
+    assert pr_text(_row("b", remote=three)).plain == "3 (2 drafts)"
+    assert pr_text(_row("c", remote=plain)).plain == "1"
+    assert pr_text(_row("d", remote=RemoteState(prs_known=True))).plain == "—"
+    assert pr_text(_row("e")).plain == "?"
+
+
+def test_behind_filter_keeps_only_repos_missing_the_remote_tip() -> None:
+    rows = [_row("stale", remote=BEHIND), _row("fresh", remote=CURRENT), _row("mute")]
+
+    kept = filter_rows(rows, behind_only=True)
+
+    assert [row.state.name for row in kept] == ["stale"]
+
+
+def test_prs_filter_keeps_only_repos_with_an_open_pr() -> None:
+    with_pr = RemoteState(prs_known=True, prs=(_pr(3),))
+    rows = [
+        _row("mine", remote=with_pr),
+        _row("none", remote=RemoteState(prs_known=True)),
+        _row("mute"),
+    ]
+
+    kept = filter_rows(rows, prs_only=True)
+
+    assert [row.state.name for row in kept] == ["mine"]
+
+
+@pytest.mark.asyncio
+async def test_pressing_b_and_p_narrow_the_table(tmp_path: Path) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+    with_pr = RemoteState(prs_known=True, prs=(_pr(3),))
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(
+            [
+                _row("stale", remote=BEHIND),
+                _row("mine", remote=with_pr),
+                _row("quiet", remote=CURRENT),
+            ],
+        )
+        await pilot.pause()
+        assert len(_keys(app)) == 3
+
+        await pilot.press("b")
+        assert _keys(app) == [str(Path("/tmp/stale"))]  # noqa: S108
+
+        await pilot.press("b")
+        await pilot.press("p")
+        assert _keys(app) == [str(Path("/tmp/mine"))]  # noqa: S108
+
+
+def test_the_detail_screen_lists_open_prs_and_the_remote_state(
+    tmp_path: Path,
+) -> None:
+    state = RemoteState(
+        slug="acme/repo",
+        default_branch="main",
+        default_sha="f" * 40,
+        behind_default=True,
+        default_known=True,
+        prs=(_pr(9, draft=True), _pr(7)),
+        prs_known=True,
+    )
+    screen = DetailScreen(
+        _row("repo", remote=state),
+        _board(tmp_path),
+        clock=lambda: 0.0,
+    )
+
+    remote = screen.remote_content().plain
+    prs = screen.prs_content(0.0).plain
+
+    assert "acme/repo" in remote
+    assert "has commits" in remote
+    assert "#9" in prs
+    assert "draft" in prs
+    assert "#7" in prs
+    assert "/pull/7" in prs
+
+
+def test_a_pr_heading_carries_a_link_and_the_url_stays_plain() -> None:
+    pr = PullRequest(
+        number=24,
+        title="chore: bump alz-addon-resources",
+        url="https://github.com/acme/repo/pull/24",
+        draft=False,
+        updated_at=0.0,
+    )
+
+    content = pr_content(pr, 90.0)
+
+    assert content.plain.splitlines() == [
+        "#24  chore: bump alz-addon-resources",
+        "1m ago  https://github.com/acme/repo/pull/24",
+    ]
+    assert _styles(content) == [
+        (
+            "#24  chore: bump alz-addon-resources",
+            "link='https://github.com/acme/repo/pull/24'",
+        ),
+        ("1m ago  https://github.com/acme/repo/pull/24", "dim"),
+    ]
+
+
+def test_a_draft_marker_sits_outside_the_link() -> None:
+    pr = PullRequest(
+        number=9,
+        title="Parked",
+        url="https://github.com/acme/repo/pull/9",
+        draft=True,
+        updated_at=None,
+    )
+
+    content = pr_content(pr, 0.0)
+
+    assert content.plain.splitlines()[0] == "#9  Parked  draft"
+    assert _styles(content)[:2] == [
+        ("#9  Parked", "link='https://github.com/acme/repo/pull/9'"),
+        ("  draft", "magenta"),
+    ]
+
+
+def test_a_title_holding_markup_renders_literally() -> None:
+    pr = PullRequest(
+        number=3,
+        title="Fix [WIP] handling of [a][b]",
+        url="https://github.com/acme/repo/pull/3",
+        draft=False,
+        updated_at=None,
+    )
+
+    assert "Fix [WIP] handling of [a][b]" in pr_content(pr, 0.0).plain
+
+
+def test_a_pr_with_no_url_is_not_linked() -> None:
+    pr = PullRequest(number=5, title="No url", url="", draft=False, updated_at=None)
+
+    assert _styles(pr_content(pr, 0.0))[0][1] != "link"
+    assert not any("link" in style for _, style in _styles(pr_content(pr, 0.0)))
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["A change", "Hybrid søk", "Fix [WIP] parsing", "Don't break", "a=b:c"],
+)
+def test_a_pr_line_parses_through_textuals_markup(title: str) -> None:
+    """A Static renders through Textual's parser, not Rich's.
+
+    An unquoted link value passed Rich and crashed Textual on the colon in
+    ``https:``, so the parser under test has to be the one the widget uses.
+    """
+    pr = PullRequest(
+        number=7,
+        title=title,
+        url="https://github.com/acme/repo/pull/7",
+        draft=True,
+        updated_at=0.0,
+    )
+
+    content = pr_content(pr, 0.0)
+
+    assert title in content.plain
+    assert "#7" in content.plain
+    assert "draft" in content.plain
+
+
+def test_a_url_holding_a_quote_is_not_linked() -> None:
+    pr = PullRequest(
+        number=5,
+        title="Odd url",
+        url="https://example.invalid/it's",
+        draft=False,
+        updated_at=None,
+    )
+
+    assert _styles(pr_content(pr, 0.0))[0][1] != "link"
+    assert not any("link" in style for _, style in _styles(pr_content(pr, 0.0)))
+
+
+@pytest.mark.asyncio
+async def test_the_table_fills_the_space_between_header_and_footer(
+    tmp_path: Path,
+) -> None:
+    """A short repo list must not strand the table's scrollbar mid-screen."""
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await _settle(app)
+        app.apply_rows([_row("one"), _row("two")])
+        await pilot.pause()
+
+        table = _table(app)
+        header = app.query_one(Header)
+        footer = app.query_one(Footer)
+        expected = app.screen.size.height - header.size.height - footer.size.height
+
+        assert table.row_count == 2
+        assert table.size.height == expected
+        assert table.region.bottom == app.screen.size.height - footer.size.height
+
+
+@pytest.mark.asyncio
+async def test_pressing_shift_p_pulls_the_selected_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[tuple[Path, str | None]] = []
+
+    def fake_pull(
+        root: Path,
+        *,
+        default_branch: str | None = None,
+    ) -> Outcome:
+        asked.append((root, default_branch))
+        return Outcome(ok=True, message="pulled 3 commits", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", fake_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+        _record_notes(app, notes, monkeypatch)
+
+        await pilot.press("P")
+        await _settle(app)
+        await pilot.pause()
+
+    assert asked == [(Path("/tmp/stale"), "main")]  # noqa: S108
+    assert notes[0] == "pulling stale…"
+    assert notes[-1] == "stale: pulled 3 commits (main)"
+
+
+@pytest.mark.asyncio
+async def test_a_second_shift_p_does_not_start_a_second_pull(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two git processes in one repo fight over index.lock."""
+    started = threading.Event()
+    release = threading.Event()
+    runs: list[Path] = []
+
+    def blocking_pull(root: Path, *, default_branch: str | None = None) -> Outcome:
+        assert default_branch == "main"
+        runs.append(root)
+        started.set()
+        release.wait(timeout=5.0)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", blocking_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+        _record_notes(app, notes, monkeypatch)
+
+        await pilot.press("P")
+        assert started.wait(timeout=5.0)
+        await pilot.press("P")
+        await pilot.pause()
+        second = list(notes)
+        release.set()
+        await _settle(app)
+
+    assert len(runs) == 1
+    assert "stale is already pulling" in second
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pull_notifies_as_an_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_pull(_root: Path, **_kwargs: object) -> Outcome:
+        return Outcome(
+            ok=False,
+            message="fetch failed: fatal: could not read from remote",
+        )
+
+    monkeypatch.setattr("cboard2.tui.pull_default", failing_pull)
+    severities: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+        _record_severities(app, severities, monkeypatch)
+
+        await pilot.press("P")
+        await _settle(app)
+        await pilot.pause()
+
+    assert severities[-1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_shift_p_on_an_empty_table_does_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[Path] = []
+
+    def recording_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        await pilot.press("P")
+        await pilot.pause()
+
+    assert runs == []

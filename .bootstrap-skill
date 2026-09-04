@@ -1,0 +1,215 @@
+---
+name: python-bootstrap
+description: "Use when setting up a new Python project, modernizing an existing project's tooling, or migrating from legacy tools (tox, black, isort, mypy, bandit, setuptools). Triggered by phrases like 'new python project', 'python bootstrap', 'set up a python project', 'modernize python tooling', 'migrate from tox'."
+---
+
+# Python Project Bootstrap
+
+Set up new Python projects or migrate existing ones to a modern 2026+ tooling stack.
+
+## The Stack
+
+| Layer | Tool | Replaces |
+|---|---|---|
+| Package manager | **uv** | pip, virtualenv, pip-tools, tox |
+| Build backend | **hatchling** | setuptools, setup.cfg, setup.py |
+| Formatter | **ruff format** | black, isort |
+| Linter | **ruff check** | flake8, bandit, isort, pyupgrade, dozens of plugins |
+| Type checker | **pyright** (strict) | mypy |
+| Dead code | **vulture** | manual review |
+| Task runner | **just** | tox, Makefile |
+| WSGI server | **granian** | uWSGI, gunicorn |
+| Tests | **pytest** + xdist + testmon + timeout | unittest, nose |
+| Dev deps | **`[dependency-groups]`** (PEP 735) | `[project.optional-dependencies]` |
+| Issue tracking | **dcat** (dogcat) | GitHub Issues, Jira, plain TODO lists |
+
+**Do NOT use:** black, isort, mypy, bandit, tox, setuptools, `pip install`, `npm`, `[project.optional-dependencies]` for dev deps.
+
+- **Python version support:** templates target the single pinned version (`requires-python` in pyproject.toml). If the project is a library that must support multiple versions, test them via a CI matrix — don't loosen the pin.
+- **CLI entry points:** for command-line tools, expose commands via `[project.scripts]` (see core-templates.md).
+- **No pre-commit:** pre-commit is intentionally not used — the justfile recipes and CI cover formatting/linting. Do not re-add it on re-bootstrap.
+
+---
+
+## Re-bootstrapping
+
+When a project already has a `.bootstrap` file, this is a **re-bootstrap** — the project was previously set up with this skill and needs to be brought in line with the current version.
+
+### Flow
+
+1. Diff `.bootstrap-skill` against `~/.claude/skills/python-bootstrap/SKILL.md`
+2. Summarize the changes to the user before making any modifications
+3. Walk the checklist (see bottom of this file), focusing on areas affected by the diff
+4. Apply changes, then update `.bootstrap` (date) and `.bootstrap-skill` (full copy of current SKILL.md)
+
+### What counts as a re-bootstrap
+
+- User says "bootstrap", "modernize", or "update tooling" on a project that has `.bootstrap`
+- If `.bootstrap` exists but `.bootstrap-skill` is missing, treat it as a full re-bootstrap (walk entire checklist)
+
+---
+
+## New Project Quick Start
+
+```bash
+mkdir myproject && cd myproject
+uv init --package myproject
+# Rearrange into src/ layout if uv didn't already
+uv add --group dev ruff pyright vulture pytest pytest-asyncio pytest-cov pytest-xdist pytest-timeout pytest-testmon
+# Replace pyproject.toml contents with the template in core-templates.md
+# Create the justfile from the template in core-templates.md
+# Create .gitignore from the template in core-templates.md
+# Create typings/ and vulture_whitelist.py
+mkdir -p typings
+touch vulture_whitelist.py
+uv sync --group dev
+git init && git add -A && git commit -m "Initial project setup"
+dcat init    # initialize issue tracking
+# Write CLAUDE.md — see template below
+# If CLAUDE.md already exists, incorporate the dcat section into it
+# Write .bootstrap and .bootstrap-skill (see Bootstrap Stamp below)
+```
+
+### Project Layout
+
+```
+myproject/
+  src/myproject/
+    __init__.py
+    app.py
+  tests/
+    conftest.py
+    test_app.py
+  typings/               # stub files for untyped third-party deps
+  pyproject.toml         # ALL config lives here — single source of truth
+  justfile               # task runner
+  uv.lock                # committed to git
+  vulture_whitelist.py   # dead code whitelist
+  .dogcats/              # dcat issue tracking (committed to git)
+  CLAUDE.md              # agent instructions (dcat workflow + project-specific)
+  .python-version        # pin python version (created by uv)
+  .gitignore             # see template in core-templates.md
+  .bootstrap             # skill name + date of last bootstrap
+  .bootstrap-skill       # full snapshot of SKILL.md at last bootstrap
+  Dockerfile             # optional — multi-stage uv build
+```
+
+See [core-templates.md](core-templates.md) for the complete pyproject.toml, justfile, Dockerfile, GitHub Actions CI, and .gitignore templates.
+
+See [web-templates.md](web-templates.md) for web application additions (djlint, oxlint, oxfmt, stylelint, vitest, package.json, web justfile recipes, web layout, and web quick start).
+
+See [migration-guide.md](migration-guide.md) for migrating from legacy tooling (tox, setuptools, black, isort, mypy, bandit).
+
+---
+
+## Bootstrap Stamp
+
+After every bootstrap (new or re-bootstrap), write these two files:
+
+**`.bootstrap`** (get the timestamp from `date '+%Y-%m-%d %H:%M:%S'`):
+
+```
+skill: python-bootstrap
+date: YYYY-MM-DD HH:MM:SS
+```
+
+**`.bootstrap-skill`**: Full verbatim copy of `~/.claude/skills/python-bootstrap/SKILL.md` at time of bootstrap.
+
+Both files are committed to git. Together they answer: "what tooling standard was this project last aligned to, and when?"
+
+---
+
+## CLAUDE.md — Template
+
+If `CLAUDE.md` does not exist, create it with the content below. If it already exists, incorporate the "Issue tracking" section into the existing file.
+
+```markdown
+# Agent Instructions
+
+## Issue tracking
+
+This project uses **dcat** for issue tracking. Run `dcat prime --opinionated` at the start of each session to load the workflow, then `dcat list --agent-only` to see open issues. Work bugs before features and high priority before low; deviate only on explicit user instruction.
+
+Make a separate parallel Bash tool call per `dcat` command. Chaining them with `&&` and `echo` separators merges the output into one stream, so a failure in the middle is easy to miss.
+
+Mark an issue `in_progress` at the moment you start it, and `in_review` once its work is done. The status is how the user sees what you are working on right now, so it is only useful while it stays accurate.
+
+Working several related issues at once is fine. Mark only the ones you have actually started — a whole backlog marked `in_progress` conveys nothing. On a priority conflict, ask which to take first.
+
+When the user raises a new bug, feature, or anything else that warrants a code change, ask whether to create an issue before writing code. Set labels with `--labels` drawn from the issue's content: `cli`, `tui`, `api`, `docs`, `testing`, `refactor`, `ux`, `performance`.
+
+When research or discussion produces findings relevant to an existing issue, ask these as two separate questions, in order:
+
+1. "Should I update issue [id] with these findings?"
+2. "Should I start working on the implementation?"
+
+Keep them separate — the user may want the findings recorded without starting work, and one combined question forces a single answer to both.
+
+### Closing issues
+
+Wait for explicit user approval before closing any issue. `dcat reopen` exists, but reopening loses the workflow state the issue carried, so a premature close costs more than the extra turn.
+
+1. Set status to `in_review`: `dcat update --status in_review $issueId`
+2. Tell the user the issue is ready for testing
+3. Ask: "Can I close issue [id] '[title]'?"
+4. Run `dcat close` after the user confirms
+```
+
+---
+
+## Key Design Decisions
+
+### Why uv?
+Single tool replaces pip, virtualenv, pip-tools, and tox. Written in Rust, resolves dependencies in seconds. `uv run` eliminates venv activation — just run commands directly.
+
+### Why hatchling?
+Modern, fast build backend. Supports src/ layout natively. Optional `hatch-vcs` plugin for git-tag-based versioning. No `setup.py` needed.
+
+### Why PEP 735 dependency-groups?
+`[dependency-groups]` is the standard way to declare dev dependencies (PEP 735). Unlike `[project.optional-dependencies]`, dependency groups are not installable by end users — they're purely for development. uv supports them natively with `uv sync --group dev`.
+
+### Why ruff replaces 5+ tools?
+Ruff is a single Rust binary that replaces black (formatting), isort (import sorting), flake8 (linting), bandit (security), pyupgrade (modernization), and dozens of flake8 plugins. One config section, one tool, millisecond execution.
+
+### Why pyright over mypy?
+Pyright is faster, gives better error messages, integrates with VS Code/Pylance, and catches things mypy misses in strict mode. No need to run both — pyright alone is sufficient.
+
+### Why vulture?
+Neither ruff nor pyright detect dead code (unused functions, classes, variables across files). Vulture fills that gap. Use `vulture_whitelist.py` for intentional exceptions.
+
+### Why --dist=worksteal?
+pytest-xdist's `worksteal` scheduler is smarter than `loadfile` or `loadscope` — workers that finish early steal tests from slower workers. Combined with `-n 8` for 8 parallel workers.
+
+### Why COVERAGE_CORE=sysmon?
+Python 3.12+ has a new `sys.monitoring` API that's significantly faster for coverage collection than the old `sys.settrace` approach. Set this env var in `test-all` to use it.
+
+### Why --testmon?
+pytest-testmon tracks which tests are affected by code changes and only runs those. Use `just test-changed` during development for fast feedback. Use `just test-all` for full verification.
+
+### Why dcat?
+Git-native issue tracking — issues live in `.dogcats/` inside the repo, committed alongside the code. No external service needed. Supports types (bug, feature, task, epic, etc.), priorities, dependencies, parent-child relationships, and labels. Run `dcat prime` after starting a new session to load workflow instructions.
+
+---
+
+## Checklist: Is My Project Modern?
+
+- [ ] `pyproject.toml` is the only config file (no tox.ini, setup.cfg, .flake8, etc.)
+- [ ] `[dependency-groups]` for dev deps, not `[project.optional-dependencies]`
+- [ ] `hatchling` build backend, not setuptools
+- [ ] `ruff format` + `ruff check`, not black + isort + flake8
+- [ ] `pyright` in strict mode, not mypy
+- [ ] `vulture` for dead code detection
+- [ ] `just` as task runner with `fmt`, `lint`, `lint-pyright`, `lint-all`, `vulture`, `test`, `test-changed`, `test-all` recipes
+- [ ] All commands use `uv run`, never raw tool invocations
+- [ ] `.gitignore` with standard exclusions (pycache, .venv, node_modules, etc.)
+- [ ] `uv.lock` committed to git
+- [ ] `tests/` with pytest, xdist (worksteal), timeout, testmon
+- [ ] `typings/` directory for third-party stubs
+- [ ] Dockerfile uses multi-stage build with `uv sync --no-dev --no-install-project`
+- [ ] `dcat init` for git-native issue tracking (`.dogcats/` committed, `.issues.lock` in `.gitignore`)
+- [ ] `CLAUDE.md` with dcat workflow instructions (created from template or incorporated into existing)
+- [ ] `.bootstrap` with skill name and date, `.bootstrap-skill` with full SKILL.md snapshot (both committed)
+
+### Web App Additions
+
+See [web-templates.md](web-templates.md) for the full web checklist.
