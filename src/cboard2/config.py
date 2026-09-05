@@ -39,7 +39,7 @@ DEFAULT_DORMANT_INTERVAL = 4 * 3600.0
 """Seconds between polls of a dormant repo."""
 
 DEFAULT_REMOTE = True
-"""Whether the dashboard asks GitHub about default branches and pull requests.
+"""Whether the dashboard asks each origin about default branches and pull requests.
 
 Set ``remote = false`` to keep cboard2 entirely off the network. Leaving it on
 costs nothing where ``gh`` is missing or unauthed: those repos read as unknown.

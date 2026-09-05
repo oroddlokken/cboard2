@@ -380,15 +380,16 @@ class DetailScreen(ModalScreen[None]):
             yield Static(self.entries_content(now))
 
     def remote_content(self) -> Content:
-        """Return what GitHub says about this repo's default branch."""
+        """Return what the origin says about this repo's default branch."""
         remote = self._row.remote
-        if remote.slug is None:
-            return Content.styled("no GitHub origin", "dim")
+        if remote.origin is None:
+            return Content.styled("no origin", "dim")
+        label = remote.slug or remote.origin
         if not remote.default_known:
-            return Content.assemble(remote.slug, "  ", ("not read", "dim"))
+            return Content.assemble(label, "  ", ("not read", "dim"))
         if remote.behind_default:
             return Content.assemble(
-                remote.slug,
+                label,
                 "  ",
                 (
                     f"{remote.default_branch} has commits this clone has not pulled",
@@ -398,7 +399,7 @@ class DetailScreen(ModalScreen[None]):
                 (f"remote tip {remote.default_sha}", "dim"),
             )
         return Content.assemble(
-            remote.slug,
+            label,
             "  ",
             (f"{remote.default_branch} is current", "dim"),
         )

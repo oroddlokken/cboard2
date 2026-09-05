@@ -81,6 +81,17 @@ def test_a_read_survives_a_round_trip(tmp_path: Path) -> None:
     assert loaded.prs["acme/one"][0].updated_at == READ_AT - 60.0
 
 
+def test_an_origin_url_round_trips_as_its_own_key(tmp_path: Path) -> None:
+    origin = "git@git.example.com:acme/one.git"
+    target = tmp_path / "remote.json"
+    save(target, _cached(defaults={origin: ("trunk", SHA)}, prs={}))
+
+    loaded = load(target)
+
+    assert loaded is not None
+    assert loaded.defaults == {origin: ("trunk", SHA)}
+
+
 def test_a_failed_search_round_trips_as_unknown(tmp_path: Path) -> None:
     target = tmp_path / "remote.json"
     save(target, _cached(prs={}, prs_known=False))

@@ -8,8 +8,9 @@ at the top.
 
 ## Requirements
 
-Python 3.13 and git. The Remote and PR columns need [`gh`](https://cli.github.com)
-authenticated; without it those columns read `?` and the rest still works.
+Python 3.13 and git. A GitHub repo needs [`gh`](https://cli.github.com)
+authenticated for its Remote and PR columns; without it those cells read `?` and
+the rest still works.
 
 ## Install
 
@@ -29,7 +30,7 @@ Each row is one repo:
 | Last commit | Age of that commit |
 | State | `S2 M1 ?3` is two staged files, one modified, three untracked |
 | `↑↓` | Commits ahead of and behind the upstream |
-| Remote, PR | Default branch and open PRs, from GitHub |
+| Remote, PR | Default branch and open PRs. PRs come from GitHub; the default branch comes from any origin |
 | Active | When you last touched the repo |
 
 Active counts working-tree edits, not just commits, so an hour of uncommitted
@@ -37,7 +38,7 @@ work still sorts you to the top.
 
 | Key | Does |
 |-----|------|
-| `enter` | Detail for the selected repo: GitHub state, your open PRs, changed files, branches, recent HEAD movements |
+| `enter` | Detail for the selected repo: remote state, your open PRs, changed files, branches, recent HEAD movements |
 | `a` | Activity feed across all repos, read from their reflogs |
 | `d` `u` `b` `p` | Filter to dirty / unpushed / behind / has-open-PR |
 | `s` | Sort by recent, name, or dirty |
@@ -53,14 +54,14 @@ work still sorts you to the top.
 
 ```bash
 cboard2 ls                  # the table, as plain columns
-cboard2 ls --remote         # add the GitHub columns, served from the cache
+cboard2 ls --remote         # add the remote columns, served from the cache
 cboard2 json --since 2h     # the same rows as JSON
 cboard2 busy --since 5m     # exit 0 if anything moved in the last 5 minutes
 ```
 
 `busy` is meant for a tmux statusline or a shell guard. `--since` takes `30s`,
-`5m`, `2h`, `1d`. `--refresh` asks GitHub now instead of reading the cache, and
-implies `--remote`.
+`5m`, `2h`, `1d`. `--refresh` asks the origins now instead of reading the cache,
+and implies `--remote`.
 
 ## Config
 
@@ -79,7 +80,7 @@ dormant = ["~/git/old-thing"]
 | `max_depth` | `1` | Levels below a root to descend. Use `2` for `~/git/<org>/<repo>` |
 | `dormant` | `[]` | Repos polled on the dormant interval instead of every tick |
 | `dormant_interval` | `4h` | How often a dormant repo is polled |
-| `remote` | `true` | Whether to ask GitHub anything at all |
+| `remote` | `true` | Whether to ask any origin anything at all |
 | `remote_interval` | `5m` | How often to ask |
 | `worktrees` | `true` | Whether a repo's linked worktrees get rows of their own |
 
@@ -108,8 +109,11 @@ movement with a timestamp and a verb. Working-tree edits touch nothing under
 `.git`, so "last edited" is the newest mtime among the paths git reports dirty.
 
 The remote columns come from one batched GraphQL query for default branches and
-one `gh search prs` for your open PRs. cboard2 never fetches: rewriting
-`refs/remotes/origin/*` under you would change what your next `git log` shows.
+one `gh search prs` for your open PRs. An origin that is not on github.com gets
+`git ls-remote --symref origin HEAD` instead, so a self-hosted or GitLab remote
+still reports its default branch; those repos show no PRs. cboard2 never
+fetches: rewriting `refs/remotes/origin/*` under you would change what your next
+`git log` shows.
 
 ## Development
 

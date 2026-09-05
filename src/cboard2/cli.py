@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument(
             "--refresh",
             action="store_true",
-            help="ask GitHub now, ignoring the cache; implies --remote",
+            help="ask the origins now, ignoring the cache; implies --remote",
         )
     return parser
 
@@ -174,6 +174,7 @@ def _remote_dict(row: Row) -> dict[str, object]:
     """Return the remote fields for one row, JSON-ready."""
     remote = row.remote
     return {
+        "origin": remote.origin,
         "slug": remote.slug,
         "default_branch": remote.default_branch,
         "default_sha": remote.default_sha,
@@ -196,7 +197,7 @@ def _remote_dict(row: Row) -> dict[str, object]:
 def format_table(rows: Sequence[Row], now: float, *, remote: bool = False) -> str:
     """Render the rows as columns padded to their widest cell.
 
-    ``remote`` adds the two GitHub columns. They are left out otherwise
+    ``remote`` adds the two remote columns. They are left out otherwise
     because a bare ``ls`` makes no network call and would print a column of
     question marks.
     """

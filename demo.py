@@ -2,7 +2,7 @@
 
     uv run python demo.py
 
-Nothing here reads git or GitHub: the 45 rows are built in this file, so a
+Nothing here reads git or GitHub: the 48 rows are built in this file, so a
 screenshot shows the same repos on any machine and no private repo name reaches
 an image. Three module attributes in :mod:`cboard2.tui` would still reach the
 disk, and are replaced below for the run.
@@ -80,11 +80,34 @@ def _known(
 ) -> RemoteState:
     """Return a remote reading where both GitHub calls answered for ``name``."""
     return RemoteState(
+        origin=f"https://github.com/{_OWNER}/{name}.git",
         slug=f"{_OWNER}/{name}",
         default_branch="main",
         default_sha=_sha(name),
         default_known=True,
         prs=prs,
+        prs_known=True,
+        behind_default=behind,
+    )
+
+
+def _offsite(
+    name: str,
+    origin: str,
+    *,
+    branch: str = "master",
+    behind: bool = False,
+) -> RemoteState:
+    """Return a reading for an origin ls-remote answered and no GitHub call could.
+
+    The PRs read known and empty, which is what a repo with no GitHub side gets:
+    there is no search that could have missed one.
+    """
+    return RemoteState(
+        origin=origin,
+        default_branch=branch,
+        default_sha=_sha(name),
+        default_known=True,
         prs_known=True,
         behind_default=behind,
     )
@@ -271,6 +294,19 @@ def _featured(now: float) -> list[Row]:
             remote=_known("pipeline-tools"),
         ),
         _row(
+            "ops-runbooks",
+            now=now,
+            ago=50 * MINUTE,
+            branch="master",
+            subject="Write down the failover drill",
+            unstaged=2,
+            remote=_offsite(
+                "ops-runbooks",
+                "git@git.acme.internal:ops/runbooks.git",
+                behind=True,
+            ),
+        ),
+        _row(
             "chart-lab",
             now=now,
             ago=3 * DAY,
@@ -450,6 +486,32 @@ def _rest(now: float) -> list[Row]:
             ago=6 * DAY,
             subject="Move the incident feed to the edge cache",
             remote=_known("status-page"),
+        ),
+        _row(
+            "firmware-bridge",
+            now=now,
+            ago=6 * HOUR,
+            branch="master",
+            subject="Retry the flash after a USB reset",
+            untracked=1,
+            remote=_offsite(
+                "firmware-bridge",
+                "https://gitlab.com/acme/firmware-bridge.git",
+            ),
+        ),
+        _row(
+            "backup-scripts",
+            now=now,
+            ago=11 * DAY,
+            branch="master",
+            subject="Rotate the weekly snapshots",
+            dormant=True,
+            polled_ago=3 * HOUR,
+            remote=_offsite(
+                "backup-scripts",
+                "vault:/srv/git/backup-scripts.git",
+                behind=True,
+            ),
         ),
         _row(
             "data-warehouse",
@@ -653,7 +715,7 @@ def _rest(now: float) -> list[Row]:
 
 
 def demo_rows(now: float) -> list[Row]:
-    """Return all 45 invented repos, newest activity first."""
+    """Return all 48 invented repos, newest activity first."""
     rows = _featured(now) + _rest(now)
     return sorted(rows, key=lambda row: -row.active_at)
 

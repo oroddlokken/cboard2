@@ -3,7 +3,7 @@
 Ties the pieces together: :mod:`cboard2.config` says where to look,
 :mod:`cboard2.discovery` finds the repos, :mod:`cboard2.gitstate` reads their
 current state, :mod:`cboard2.activity` reads what happened in them and
-:mod:`cboard2.remote` reads what GitHub knows that they do not.
+:mod:`cboard2.remote` reads what their origin knows that they do not.
 """
 
 from __future__ import annotations

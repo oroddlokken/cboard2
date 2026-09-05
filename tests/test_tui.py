@@ -800,6 +800,7 @@ def _pr(number: int, *, draft: bool = False) -> PullRequest:
 
 
 BEHIND = RemoteState(
+    origin="https://github.com/acme/repo.git",
     slug="acme/repo",
     default_branch="main",
     default_sha="f" * 40,
@@ -808,6 +809,7 @@ BEHIND = RemoteState(
     prs_known=True,
 )
 CURRENT = RemoteState(
+    origin="https://github.com/acme/repo.git",
     slug="acme/repo",
     default_branch="main",
     default_sha="f" * 40,
@@ -887,6 +889,7 @@ def test_the_detail_screen_lists_open_prs_and_the_remote_state(
     tmp_path: Path,
 ) -> None:
     state = RemoteState(
+        origin="https://github.com/acme/repo.git",
         slug="acme/repo",
         default_branch="main",
         default_sha="f" * 40,
@@ -910,6 +913,31 @@ def test_the_detail_screen_lists_open_prs_and_the_remote_state(
     assert "draft" in prs
     assert "#7" in prs
     assert "/pull/7" in prs
+
+
+def test_the_detail_screen_labels_a_repo_off_github_by_its_origin(
+    tmp_path: Path,
+) -> None:
+    state = RemoteState(
+        origin="git@git.example.com:acme/repo.git",
+        default_branch="trunk",
+        default_sha="f" * 40,
+        default_known=True,
+        prs_known=True,
+    )
+    screen = DetailScreen(
+        _row("repo", remote=state), _board(tmp_path), clock=lambda: 0.0
+    )
+
+    assert "git@git.example.com:acme/repo.git" in screen.remote_content().plain
+    assert "trunk is current" in screen.remote_content().plain
+    assert screen.prs_content(0.0).plain == "none open"
+
+
+def test_the_detail_screen_says_so_when_there_is_no_origin(tmp_path: Path) -> None:
+    screen = DetailScreen(_row("repo"), _board(tmp_path), clock=lambda: 0.0)
+
+    assert screen.remote_content().plain == "no origin"
 
 
 def test_a_pr_heading_carries_a_link_and_the_url_stays_plain() -> None:

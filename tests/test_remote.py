@@ -15,10 +15,12 @@ from cboard2.remote import (
     PullRequest,
     RemoteReader,
     build_query,
+    github_slugs,
     parse_defaults,
     parse_heads,
     parse_prs,
     parse_slug,
+    parse_symref,
     run_gh,
 )
 
@@ -31,6 +33,11 @@ NOW = 1_800_000_000.0
 
 REMOTE_SHA = "a" * 40
 LOCAL_SHA = "b" * 40
+
+SSH_ORIGIN = "git@git.example.com:acme/one.git"
+"""An origin no GitHub call can answer for."""
+
+SYMREF = f"ref: refs/heads/trunk\tHEAD\n{REMOTE_SHA}\tHEAD\n"
 
 UPDATED_AT = "2026-09-04T12:00:35Z"
 """The ``updatedAt`` every canned search result carries."""
@@ -141,6 +148,39 @@ def _pr(
 )
 def test_parse_slug_names_only_github_origins(url: str, expected: str | None) -> None:
     assert parse_slug(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (SYMREF, ("trunk", REMOTE_SHA)),
+        (
+            f"ref: refs/heads/feature/x\tHEAD\n{REMOTE_SHA}\tHEAD\n",
+            ("feature/x", REMOTE_SHA),
+        ),
+        (f"{REMOTE_SHA}\tHEAD\n", None),  # a server that sends no symref line
+        ("ref: refs/heads/trunk\tHEAD\n", None),
+        (f"ref: refs/pull/7/head\tHEAD\n{REMOTE_SHA}\tHEAD\n", None),
+        ("", None),
+        ("fatal: could not read from remote repository\n", None),
+    ],
+)
+def test_parse_symref_needs_both_the_branch_and_the_tip(
+    text: str,
+    expected: tuple[str, str] | None,
+) -> None:
+    assert parse_symref(text) == expected
+
+
+def test_github_slugs_keeps_only_the_hosts_the_query_can_answer() -> None:
+    origins = [
+        "https://github.com/acme/two.git",
+        "git@github.com:acme/one.git",
+        SSH_ORIGIN,
+        "https://gitlab.com/acme/three.git",
+    ]
+
+    assert github_slugs(origins) == ["acme/one", "acme/two"]
 
 
 def test_parse_heads_reads_name_and_sha() -> None:
@@ -377,18 +417,110 @@ def test_refresh_local_before_any_read_does_nothing(tmp_path: Path) -> None:
     assert reader.cached(repo.path).behind_default is False
 
 
-def test_a_repo_with_no_github_origin_is_unknown(tmp_path: Path) -> None:
+def test_an_origin_that_answers_nothing_is_unknown(tmp_path: Path) -> None:
     repo = _repo(tmp_path, "one")
     git = FakeGit({repo.path: {"remote": "https://gitlab.com/acme/one.git\n"}})
     gh = FakeGh(graphql=_graphql(), prs="[]")
-    reader = RemoteReader(runner=git, gh=gh)
+    reader = RemoteReader(runner=git, ls_remote=FakeGit({}), gh=gh)
     reader.read([repo], NOW)
 
     state = reader.cached(repo.path)
+    assert state.origin == "https://gitlab.com/acme/one.git"
     assert state.slug is None
     assert state.default_known is False
-    assert state.prs_known is False
     assert state.behind_default is False
+
+
+def test_a_repo_with_no_origin_at_all_is_unknown(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    reader = RemoteReader(
+        runner=FakeGit({}),
+        ls_remote=FakeGit({}),
+        gh=FakeGh(graphql=_graphql(), prs="[]"),
+    )
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.origin is None
+    assert state.prs_known is False
+
+
+def test_an_origin_off_github_gets_its_default_branch_from_ls_remote(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": f"{SSH_ORIGIN}\n",
+                "for-each-ref": f"trunk\t{LOCAL_SHA}\n",
+                "merge-base": None,  # local trunk does not contain the remote tip
+            },
+        },
+    )
+    probe = FakeGit({repo.path: {"ls-remote": SYMREF}})
+    reader = RemoteReader(
+        runner=git, ls_remote=probe, gh=FakeGh(graphql=None, prs=None)
+    )
+
+    assert reader.read([repo], NOW) is True
+
+    state = reader.cached(repo.path)
+    assert state.origin == SSH_ORIGIN
+    assert state.slug is None
+    assert state.default_branch == "trunk"
+    assert state.default_sha == REMOTE_SHA
+    assert state.default_known is True
+    assert state.behind_default is True
+
+
+def test_an_origin_off_github_reports_no_prs_rather_than_unread(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": f"{SSH_ORIGIN}\n"}})
+    probe = FakeGit({repo.path: {"ls-remote": SYMREF}})
+    reader = RemoteReader(
+        runner=git, ls_remote=probe, gh=FakeGh(graphql=None, prs=None)
+    )
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.prs == ()
+    assert state.prs_known is True
+
+
+def test_a_github_origin_is_never_asked_over_the_network_twice(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    probe = FakeGit({repo.path: {"ls-remote": SYMREF}})
+    reader = RemoteReader(
+        runner=git,
+        ls_remote=probe,
+        gh=FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]"),
+    )
+    reader.read([repo], NOW)
+
+    assert probe.calls == []
+    assert reader.cached(repo.path).default_branch == "main"
+
+
+def test_a_worktree_costs_its_family_one_ls_remote(tmp_path: Path) -> None:
+    main = _repo(tmp_path, "one")
+    linked = _worktree(tmp_path, "one-wt", main)
+    git = FakeGit({main.path: {"remote": f"{SSH_ORIGIN}\n"}})
+    probe = FakeGit({main.path: {"ls-remote": SYMREF}})
+    reader = RemoteReader(
+        runner=git,
+        ls_remote=probe,
+        gh=FakeGh(graphql=None, prs=None),
+    )
+    reader.read([main, linked], NOW)
+
+    assert len(probe.calls) == 1
+    assert reader.cached(linked.path).default_branch == "trunk"
 
 
 def test_a_repo_the_query_omitted_is_unknown_not_current(tmp_path: Path) -> None:

@@ -2,13 +2,14 @@
 
 The shape it carries is :class:`cboard2.remote.Cached`.
 
-Only what the network told us is stored, keyed by ``owner/name``: the default
-branch and its tip, and the user's open pull requests. ``behind_default`` is
+Only what the network told us is stored, keyed by ``owner/name`` on GitHub and
+by the origin URL elsewhere: the default branch and its tip, and the user's open
+pull requests. ``behind_default`` is
 deliberately absent — it is derived from the local refs, so a cached copy would
 keep reporting ``behind main`` after a pull.
 :meth:`cboard2.remote.RemoteReader.refresh_local` recomputes it on load.
 
-The key is the slug rather than the repo path because that is what the answer
+The key is the remote rather than the repo path because that is what the answer
 is about. Two clones of one repo share an entry, and moving a clone does not
 invalidate it.
 """
@@ -71,15 +72,15 @@ def load(path: Path) -> Cached | None:
 
     defaults: dict[str, tuple[str, str]] = {}
     prs: dict[str, tuple[PullRequest, ...]] = {}
-    for slug, entry in _as_dict(body.get("repos")).items():
+    for key, entry in _as_dict(body.get("repos")).items():
         fields = _as_dict(entry)
         branch = fields.get("default_branch")
         sha = fields.get("default_sha")
         if isinstance(branch, str) and isinstance(sha, str):
-            defaults[slug] = (branch, sha)
+            defaults[key] = (branch, sha)
         found = _requests(fields.get("prs"))
         if found:
-            prs[slug] = found
+            prs[key] = found
 
     return Cached(
         read_at=float(read_at),
@@ -103,8 +104,8 @@ def save(path: Path, cached: Cached) -> bool:
         "read_at": cached.read_at,
         "prs_known": cached.prs_known,
         "repos": {
-            slug: _entry(cached, slug)
-            for slug in sorted(set(cached.defaults) | set(cached.prs))
+            key: _entry(cached, key)
+            for key in sorted(set(cached.defaults) | set(cached.prs))
         },
     }
     try:
@@ -130,9 +131,9 @@ def save(path: Path, cached: Cached) -> bool:
     return True
 
 
-def _entry(cached: Cached, slug: str) -> dict[str, object]:
-    """Return one slug's stored fields."""
-    branch, sha = cached.defaults.get(slug, (None, None))
+def _entry(cached: Cached, key: str) -> dict[str, object]:
+    """Return one remote's stored fields."""
+    branch, sha = cached.defaults.get(key, (None, None))
     return {
         "default_branch": branch,
         "default_sha": sha,
@@ -144,13 +145,13 @@ def _entry(cached: Cached, slug: str) -> dict[str, object]:
                 "draft": pr.draft,
                 "updated_at": pr.updated_at,
             }
-            for pr in cached.prs.get(slug, ())
+            for pr in cached.prs.get(key, ())
         ],
     }
 
 
 def _requests(value: object) -> tuple[PullRequest, ...]:
-    """Read one slug's stored PRs, skipping any entry missing a number."""
+    """Read one remote's stored PRs, skipping any entry missing a number."""
     if not isinstance(value, list):
         return ()
     found: list[PullRequest] = []

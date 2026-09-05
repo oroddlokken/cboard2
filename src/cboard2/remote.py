@@ -1,8 +1,8 @@
-"""A moved default branch and the user's own open pull requests, read from GitHub.
+"""A moved default branch and the user's own open pull requests, read from the origin.
 
 ``git status --porcelain=v2 --branch`` reports ``behind`` against the local
 remote-tracking ref, so it stays at zero until something fetches. This module
-asks GitHub directly instead, and never fetches: a poll that rewrote
+asks the origin directly instead, and never fetches: a poll that rewrote
 ``refs/remotes/origin/*`` under the user would change what their next ``git
 log`` shows.
 
@@ -13,20 +13,25 @@ query took 4.4s, against 1.7s per repo for ``git ls-remote`` — which is why th
 query is batched and why the read runs on its own slow interval rather than the
 2s poll tick.
 
+An origin that is not on github.com gets ``git ls-remote --symref origin HEAD``
+instead, one call per repo on the same slow clock. It reads refs and writes
+none, so the rule above holds for it too.
+
 The read runs on two clocks. :meth:`RemoteReader.read` asks GitHub on the slow
 one; :meth:`RemoteReader.refresh_local` recomputes whether the answer has been
 merged in yet, from the local refs, on every poll. Without that split a pull
 stays invisible for the rest of the network interval, which is the whole
 question the column exists to answer.
 
-Everything degrades to unknown. A missing ``gh``, an expired token, a
-non-GitHub origin and a repo that was deleted upstream all leave the row saying
+Everything degrades to unknown. A missing ``gh``, an expired token, an
+unreachable host and a repo that was deleted upstream all leave the row saying
 so, rather than reading as current.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -52,6 +57,13 @@ if TYPE_CHECKING:
 GH_TIMEOUT = 30.0
 """Seconds before a gh call is abandoned and its repos left unknown."""
 
+LS_REMOTE_TIMEOUT = 15.0
+"""Seconds before an ls-remote is abandoned and its repo left unknown.
+
+Longer than the 5s cap on a local git call, because this one waits on a host
+and an ssh handshake before git says anything.
+"""
+
 DEFAULT_REMOTE_INTERVAL = 300.0
 """Seconds between remote reads.
 
@@ -69,6 +81,7 @@ PR_SEARCH_LIMIT = 100
 """Open PRs the search returns. A user past this has the oldest ones dropped."""
 
 _ORIGIN_ARGS = ("remote", "get-url", "origin")
+_LS_REMOTE_ARGS = ("ls-remote", "--symref", "origin", "HEAD")
 _HEADS_ARGS = (
     "for-each-ref",
     "refs/heads",
@@ -117,6 +130,9 @@ class RemoteState:
     separately: an expired token blanks both, a repo deleted upstream blanks
     only its default branch.
     """
+
+    origin: str | None = None
+    """The origin URL. ``slug`` is set only when it names a github.com repo."""
 
     slug: str | None = None
     default_branch: str | None = None
@@ -190,6 +206,34 @@ def run_gh(args: Sequence[str]) -> str | None:
     return result.stdout.strip() or None
 
 
+def run_ls_remote(root: Path, args: Sequence[str]) -> str | None:
+    """Run one git call that talks to a remote; return stdout, or None on failure.
+
+    The environment makes every credential prompt fail rather than wait: a
+    worker blocked on a passphrase holds the read open until its timeout.
+    """
+    ssh = os.environ.get("GIT_SSH_COMMAND", "ssh")
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_SSH_COMMAND": f"{ssh} -o BatchMode=yes",
+    }
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["git", "--no-optional-locks", "-C", str(root), *args],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=LS_REMOTE_TIMEOUT,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def leaders(repos: Sequence[Repo]) -> list[Repo]:
     """Return one repo per family, in the order given.
 
@@ -214,6 +258,34 @@ def parse_slug(url: str) -> str | None:
     if match is None:
         return None
     return f"{match['owner']}/{match['name']}"
+
+
+def github_slugs(origins: Iterable[str]) -> list[str]:
+    """Return the sorted GitHub slugs among ``origins``, dropping every other host."""
+    return sorted({slug for url in origins if (slug := parse_slug(url)) is not None})
+
+
+def parse_symref(text: str) -> tuple[str, str] | None:
+    """Read ``ls-remote --symref origin HEAD`` as a default branch name and tip sha.
+
+    Both lines are required. A server that answers with the sha alone leaves the
+    branch unnamed, and the local comparison needs that name to find its branch.
+    """
+    branch: str | None = None
+    sha: str | None = None
+    for line in text.splitlines():
+        left, tab, ref = line.partition("\t")
+        if not tab or ref.strip() != "HEAD":
+            continue
+        if left.startswith("ref: "):
+            target = left.removeprefix("ref: ").strip()
+            if target.startswith("refs/heads/"):
+                branch = target.removeprefix("refs/heads/")
+        else:
+            sha = left.strip()
+    if branch is None or sha is None:
+        return None
+    return branch, sha
 
 
 def parse_heads(text: str) -> dict[str, str]:
@@ -346,6 +418,7 @@ class RemoteReader:
         *,
         max_workers: int = DEFAULT_MAX_WORKERS,
         runner: GitRunner = run_git,
+        ls_remote: GitRunner = run_ls_remote,
         gh: GhRunner = run_gh,
         load: CacheLoader | None = None,
         save: CacheSaver | None = None,
@@ -353,6 +426,7 @@ class RemoteReader:
         self._interval = interval
         self._max_workers = max_workers
         self._runner = runner
+        self._ls_remote = ls_remote
         self._gh = gh
         self._load = load
         self._save = save
@@ -390,10 +464,10 @@ class RemoteReader:
         if cached is None:
             return False
 
-        slugs = self._slugs(repos)
+        origins = self._origins(repos)
         self._states = {
             repo.path: self._state(
-                slug=slugs.get(repo.path),
+                origin=origins.get(repo.path),
                 defaults=cached.defaults,
                 prs=cached.prs if cached.prs_known else None,
             )
@@ -410,7 +484,7 @@ class RemoteReader:
         *,
         force: bool = False,
     ) -> bool:
-        """Ask GitHub about every repo and return whether anything was read.
+        """Ask every origin about its default branch, and report whether it ran.
 
         Returns False without a network call when the interval has not elapsed
         and ``force`` is unset. Finishes by calling :meth:`refresh_local`, so
@@ -419,13 +493,14 @@ class RemoteReader:
         if not (force or self.due(now)):
             return False
 
-        slugs = self._slugs(repos)
-        defaults = self._defaults(sorted(set(slugs.values())))
+        origins = self._origins(repos)
+        defaults = self._defaults(github_slugs(origins.values()))
+        defaults.update(self._probe(repos, origins))
         prs = self._prs()
 
         self._states = {
             repo.path: self._state(
-                slug=slugs.get(repo.path),
+                origin=origins.get(repo.path),
                 defaults=defaults,
                 prs=prs,
             )
@@ -488,22 +563,28 @@ class RemoteReader:
     def _state(
         self,
         *,
-        slug: str | None,
+        origin: str | None,
         defaults: Mapping[str, tuple[str, str]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
     ) -> RemoteState:
-        """Assemble one repo's network facts. ``behind_default`` is left to later."""
-        if slug is None:
+        """Assemble one repo's network facts. ``behind_default`` is left to later.
+
+        A repo off GitHub reports its PRs known and empty: no search could have
+        found one, so an unread marker would promise an answer that never comes.
+        """
+        if origin is None:
             return UNKNOWN
-        default = defaults.get(slug)
+        slug = parse_slug(origin)
+        default = defaults.get(slug or origin)
         branch, sha = default or (None, None)
         return RemoteState(
+            origin=origin,
             slug=slug,
             default_branch=branch,
             default_sha=sha,
             default_known=default is not None,
-            prs=() if prs is None else prs.get(slug, ()),
-            prs_known=prs is not None,
+            prs=() if slug is None or prs is None else prs.get(slug, ()),
+            prs_known=slug is None or prs is not None,
         )
 
     def _behind(
@@ -541,23 +622,47 @@ class RemoteReader:
             self._ancestry[key] = contained
         return not contained
 
-    def _slugs(self, repos: Sequence[Repo]) -> dict[Path, str]:
-        """Resolve each family's origin to ``owner/name``, dropping the rest.
+    def _origins(self, repos: Sequence[Repo]) -> dict[Path, str]:
+        """Read each family's origin URL, and hand it back per path.
 
         Answered per family and handed back per path, because the caller holds
         one state per row.
         """
 
-        def slug(repo: Repo) -> tuple[Path, str | None]:
+        def origin(repo: Repo) -> tuple[Path, str | None]:
             out = self._runner(repo.path, _ORIGIN_ARGS)
-            return repo.family, None if out is None else parse_slug(out)
+            return repo.family, None if out is None else out.strip() or None
 
         found = {
-            family: name
-            for family, name in self._map(slug, leaders(repos))
-            if name is not None
+            family: url
+            for family, url in self._map(origin, leaders(repos))
+            if url is not None
         }
         return {repo.path: found[repo.family] for repo in repos if repo.family in found}
+
+    def _probe(
+        self,
+        repos: Sequence[Repo],
+        origins: Mapping[Path, str],
+    ) -> dict[str, tuple[str, str]]:
+        """Ask the origins GitHub cannot answer for what their HEAD points at.
+
+        Keyed by URL rather than by path, which is the same key the GraphQL
+        answers use and never collides with an ``owner/name``.
+        """
+        targets = [
+            repo
+            for repo in leaders(repos)
+            if (url := origins.get(repo.path)) is not None and parse_slug(url) is None
+        ]
+
+        def probe(repo: Repo) -> tuple[str, tuple[str, str] | None]:
+            out = self._ls_remote(repo.path, _LS_REMOTE_ARGS)
+            return origins[repo.path], None if out is None else parse_symref(out)
+
+        return {
+            url: found for url, found in self._map(probe, targets) if found is not None
+        }
 
     def _heads(self, repos: Sequence[Repo]) -> dict[Path, dict[str, str]]:
         """Read the local branch tips once per family, keyed by family."""

@@ -309,6 +309,7 @@ def test_json_always_carries_the_remote_object(
     rows = json.loads(capsys.readouterr().out)
 
     assert rows[0]["remote"] == {
+        "origin": None,
         "slug": None,
         "default_branch": None,
         "default_sha": None,
