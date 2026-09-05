@@ -2,7 +2,7 @@
 
     uv run python demo.py
 
-Nothing here reads git or GitHub: the 48 rows are built in this file, so a
+Nothing here reads git or GitHub: the 49 rows are built in this file, so a
 screenshot shows the same repos on any machine and no private repo name reaches
 an image. Three module attributes in :mod:`cboard2.tui` would still reach the
 disk, and are replaced below for the run.
@@ -76,9 +76,14 @@ def _known(
     name: str,
     *,
     behind: bool = False,
+    behind_branch: str | None = None,
     prs: tuple[PullRequest, ...] = (),
 ) -> RemoteState:
-    """Return a remote reading where both GitHub calls answered for ``name``."""
+    """Return a remote reading where both GitHub calls answered for ``name``.
+
+    ``behind_branch`` names a checked-out branch whose copy on the origin has
+    moved on, which the Remote column reports ahead of the default branch.
+    """
     return RemoteState(
         origin=f"https://github.com/{_OWNER}/{name}.git",
         slug=f"{_OWNER}/{name}",
@@ -88,6 +93,11 @@ def _known(
         prs=prs,
         prs_known=True,
         behind_default=behind,
+        branch=behind_branch,
+        branch_remote=behind_branch,
+        branch_sha=None if behind_branch is None else _sha(behind_branch),
+        branch_known=behind_branch is not None,
+        behind_branch=behind_branch is not None,
     )
 
 
@@ -375,6 +385,16 @@ def _rest(now: float) -> list[Row]:
             ago=48 * MINUTE,
             subject="Log the token audience on a rejected request",
             remote=_known("auth-gateway", behind=True),
+        ),
+        _row(
+            "invoice-service",
+            now=now,
+            ago=55 * MINUTE,
+            branch="fix/rounding",
+            subject="Round the tax line the way the ledger does",
+            unstaged=1,
+            ahead=1,
+            remote=_known("invoice-service", behind_branch="fix/rounding"),
         ),
         _row(
             "design-tokens",
@@ -715,7 +735,7 @@ def _rest(now: float) -> list[Row]:
 
 
 def demo_rows(now: float) -> list[Row]:
-    """Return all 48 invented repos, newest activity first."""
+    """Return all 49 invented repos, newest activity first."""
     rows = _featured(now) + _rest(now)
     return sorted(rows, key=lambda row: -row.active_at)
 

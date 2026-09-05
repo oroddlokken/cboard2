@@ -3,11 +3,11 @@
 The shape it carries is :class:`cboard2.remote.Cached`.
 
 Only what the network told us is stored, keyed by ``owner/name`` on GitHub and
-by the origin URL elsewhere: the default branch and its tip, and the user's open
-pull requests. ``behind_default`` is
-deliberately absent — it is derived from the local refs, so a cached copy would
-keep reporting ``behind main`` after a pull.
-:meth:`cboard2.remote.RemoteReader.refresh_local` recomputes it on load.
+by the origin URL elsewhere: the default branch and its tip, the tip of each
+branch the read asked about by name, and the user's open pull requests. The two
+behind markers are deliberately absent — they are derived from the local refs,
+so a cached copy would keep reporting ``behind main`` after a pull.
+:meth:`cboard2.remote.RemoteReader.refresh_local` recomputes them on load.
 
 The key is the remote rather than the repo path because that is what the answer
 is about. Two clones of one repo share an entry, and moving a clone does not
@@ -20,14 +20,17 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from cboard2.remote import Cached, PullRequest
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _ENV_CACHE_PATH = "CBOARD2_CACHE"
 """Env var pointing at an alternate cache file, for tests and power users."""
 
-VERSION = 1
+VERSION = 2
 """Schema version. A file written by another version is read as a cold cache."""
 
 
@@ -71,6 +74,7 @@ def load(path: Path) -> Cached | None:
         return None
 
     defaults: dict[str, tuple[str, str]] = {}
+    branches: dict[str, Mapping[str, str]] = {}
     prs: dict[str, tuple[PullRequest, ...]] = {}
     for key, entry in _as_dict(body.get("repos")).items():
         fields = _as_dict(entry)
@@ -78,6 +82,9 @@ def load(path: Path) -> Cached | None:
         sha = fields.get("default_sha")
         if isinstance(branch, str) and isinstance(sha, str):
             defaults[key] = (branch, sha)
+        tips = _tips(fields.get("branches"))
+        if tips:
+            branches[key] = tips
         found = _requests(fields.get("prs"))
         if found:
             prs[key] = found
@@ -85,6 +92,7 @@ def load(path: Path) -> Cached | None:
     return Cached(
         read_at=float(read_at),
         defaults=defaults,
+        branches=branches,
         prs=prs,
         prs_known=body.get("prs_known") is True,
     )
@@ -105,7 +113,9 @@ def save(path: Path, cached: Cached) -> bool:
         "prs_known": cached.prs_known,
         "repos": {
             key: _entry(cached, key)
-            for key in sorted(set(cached.defaults) | set(cached.prs))
+            for key in sorted(
+                set(cached.defaults) | set(cached.branches) | set(cached.prs),
+            )
         },
     }
     try:
@@ -137,6 +147,7 @@ def _entry(cached: Cached, key: str) -> dict[str, object]:
     return {
         "default_branch": branch,
         "default_sha": sha,
+        "branches": dict(cached.branches.get(key, {})),
         "prs": [
             {
                 "number": pr.number,
@@ -147,6 +158,15 @@ def _entry(cached: Cached, key: str) -> dict[str, object]:
             }
             for pr in cached.prs.get(key, ())
         ],
+    }
+
+
+def _tips(value: object) -> dict[str, str]:
+    """Read one remote's stored branch tips, skipping anything not two strings."""
+    return {
+        name: sha
+        for name, sha in _as_dict(value).items()
+        if isinstance(sha, str) and name
     }
 
 

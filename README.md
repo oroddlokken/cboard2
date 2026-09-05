@@ -30,7 +30,7 @@ Each row is one repo:
 | Last commit | Age of that commit |
 | State | `S2 M1 ?3` is two staged files, one modified, three untracked |
 | `↑↓` | Commits ahead of and behind the upstream |
-| Remote, PR | Default branch and open PRs. PRs come from GitHub; the default branch comes from any origin |
+| Remote, PR | Which branch the origin has moved on, and your open PRs. `behind origin/fix` is the checked-out branch, `behind main` the default one. PRs come from GitHub; the branches come from any origin |
 | Active | When you last touched the repo |
 
 Active counts working-tree edits, not just commits, so an hour of uncommitted
@@ -109,11 +109,16 @@ movement with a timestamp and a verb. Working-tree edits touch nothing under
 `.git`, so "last edited" is the newest mtime among the paths git reports dirty.
 
 The remote columns come from one batched GraphQL query for default branches and
-one `gh search prs` for your open PRs. An origin that is not on github.com gets
-`git ls-remote --symref origin HEAD` instead, so a self-hosted or GitLab remote
-still reports its default branch; those repos show no PRs. cboard2 never
-fetches: rewriting `refs/remotes/origin/*` under you would change what your next
-`git log` shows.
+checked-out branches, and one `gh search prs` for your open PRs. An origin that
+is not on github.com gets `git ls-remote --symref origin HEAD` instead, with the
+same branches named as extra refs, so a self-hosted or GitLab remote still
+reports both; those repos show no PRs. cboard2 never fetches: rewriting
+`refs/remotes/origin/*` under you would change what your next `git log` shows.
+
+A checkout is compared against the branch its upstream names, or against the
+same name on `origin` when it tracks nothing. A branch tracking another remote
+is left unanswered, and the `↑↓` column keeps its own meaning: that one is read
+from your remote-tracking refs and moves only when you fetch.
 
 ## Development
 

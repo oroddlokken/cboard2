@@ -33,6 +33,7 @@ from cboard2.config import config_path
 from cboard2.configwrite import toggled, write_dormant
 from cboard2.discovery import main_name
 from cboard2.pull import pull_default
+from cboard2.remote import ORIGIN
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -91,7 +92,9 @@ def filter_rows(
     if unpushed_only:
         kept = [row for row in kept if row.state.ahead]
     if behind_only:
-        kept = [row for row in kept if row.remote.behind_default]
+        kept = [
+            row for row in kept if row.remote.behind_default or row.remote.behind_branch
+        ]
     if prs_only:
         kept = [row for row in kept if row.remote.prs]
     if since is not None:
@@ -191,12 +194,16 @@ def ahead_behind_text(row: Row) -> Text:
 
 
 def remote_text(row: Row) -> Text:
-    """Render whether the remote's newest default-branch commit has been pulled.
+    """Render which branch has commits on the origin this clone has not pulled.
 
-    ``?`` and ``—`` are different answers: the first means no remote read
-    covered this repo, the second that the branch is current.
+    The checked-out branch is reported ahead of the default branch, because it
+    is the one the user is standing on. ``?`` and ``—`` are different answers:
+    the first means no remote read covered this repo, the second that it is
+    current.
     """
     remote = row.remote
+    if remote.behind_branch:
+        return Text(f"behind {ORIGIN}/{remote.branch_remote}", style="yellow")
     if not remote.default_known:
         return Text("?", style="dim")
     if remote.behind_default:
@@ -380,17 +387,41 @@ class DetailScreen(ModalScreen[None]):
             yield Static(self.entries_content(now))
 
     def remote_content(self) -> Content:
-        """Return what the origin says about this repo's default branch."""
+        """Return what the origin says about this repo's branches.
+
+        The checked-out branch comes first when it lags, and the default
+        branch's line follows either way: a feature branch behind its own
+        remote copy says nothing about whether ``main`` here is current.
+        """
         remote = self._row.remote
         if remote.origin is None:
             return Content.styled("no origin", "dim")
         label = remote.slug or remote.origin
         if not remote.default_known:
             return Content.assemble(label, "  ", ("not read", "dim"))
-        if remote.behind_default:
+        if remote.behind_branch:
             return Content.assemble(
                 label,
                 "  ",
+                (
+                    (
+                        f"{ORIGIN}/{remote.branch_remote} has commits "
+                        "this branch has not pulled"
+                    ),
+                    "yellow",
+                ),
+                "\n",
+                (f"remote tip {remote.branch_sha}", "dim"),
+                "\n",
+                self._default_line(),
+            )
+        return Content.assemble(label, "  ", self._default_line())
+
+    def _default_line(self) -> Content:
+        """Return the origin's word on this repo's default branch, without the label."""
+        remote = self._row.remote
+        if remote.behind_default:
+            return Content.assemble(
                 (
                     f"{remote.default_branch} has commits this clone has not pulled",
                     "yellow",
@@ -398,11 +429,7 @@ class DetailScreen(ModalScreen[None]):
                 "\n",
                 (f"remote tip {remote.default_sha}", "dim"),
             )
-        return Content.assemble(
-            label,
-            "  ",
-            (f"{remote.default_branch} is current", "dim"),
-        )
+        return Content.styled(f"{remote.default_branch} is current", "dim")
 
     def prs_content(self, now: float) -> Content:
         """Return the user's open PRs on this repo, newest number first."""

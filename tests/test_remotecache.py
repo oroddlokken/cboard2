@@ -33,12 +33,14 @@ def _pr(number: int, *, draft: bool = False) -> PullRequest:
 def _cached(
     *,
     defaults: Mapping[str, tuple[str, str]] | None = None,
+    branches: Mapping[str, Mapping[str, str]] | None = None,
     prs: Mapping[str, tuple[PullRequest, ...]] | None = None,
     prs_known: bool = True,
 ) -> Cached:
     return Cached(
         read_at=READ_AT,
         defaults={"acme/one": ("main", SHA)} if defaults is None else defaults,
+        branches={"acme/one": {"fix": SHA}} if branches is None else branches,
         prs={"acme/one": (_pr(9, draft=True), _pr(7))} if prs is None else prs,
         prs_known=prs_known,
     )
@@ -74,6 +76,7 @@ def test_a_read_survives_a_round_trip(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.read_at == READ_AT
     assert loaded.defaults == {"acme/one": ("main", SHA)}
+    assert loaded.branches == {"acme/one": {"fix": SHA}}
     assert loaded.prs_known is True
     assert [pr.number for pr in loaded.prs["acme/one"]] == [9, 7]
     assert [pr.draft for pr in loaded.prs["acme/one"]] == [True, False]
@@ -224,3 +227,40 @@ def test_a_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
     save(target, _cached())
 
     assert sorted(entry.name for entry in os.scandir(tmp_path)) == ["remote.json"]
+
+
+def test_a_remote_with_only_branch_tips_is_still_written(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    save(target, _cached(defaults={}, branches={"acme/one": {"fix": SHA}}, prs={}))
+
+    loaded = load(target)
+
+    assert loaded is not None
+    assert loaded.defaults == {}
+    assert loaded.branches == {"acme/one": {"fix": SHA}}
+
+
+def test_a_branch_tip_that_is_not_a_sha_is_dropped(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": VERSION,
+                "read_at": READ_AT,
+                "prs_known": True,
+                "repos": {
+                    "acme/one": {
+                        "default_branch": "main",
+                        "default_sha": SHA,
+                        "branches": {"fix": 7, "spike": SHA},
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load(target)
+
+    assert loaded is not None
+    assert loaded.branches == {"acme/one": {"spike": SHA}}

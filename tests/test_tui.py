@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -816,12 +817,32 @@ CURRENT = RemoteState(
     default_known=True,
     prs_known=True,
 )
+BEHIND_BRANCH = RemoteState(
+    origin="https://github.com/acme/repo.git",
+    slug="acme/repo",
+    default_branch="main",
+    default_sha="f" * 40,
+    default_known=True,
+    prs_known=True,
+    branch="fix",
+    branch_remote="fix",
+    branch_sha="e" * 40,
+    branch_known=True,
+    behind_branch=True,
+)
 
 
 def test_remote_column_separates_behind_current_and_unknown() -> None:
     assert remote_text(_row("a", remote=BEHIND)).plain == "behind main"
     assert remote_text(_row("b", remote=CURRENT)).plain == "—"
     assert remote_text(_row("c")).plain == "?"
+
+
+def test_remote_column_names_the_branch_ahead_of_the_default() -> None:
+    both = replace(BEHIND_BRANCH, behind_default=True)
+
+    assert remote_text(_row("a", remote=BEHIND_BRANCH)).plain == "behind origin/fix"
+    assert remote_text(_row("b", remote=both)).plain == "behind origin/fix"
 
 
 def test_pr_column_counts_drafts_apart() -> None:
@@ -840,11 +861,16 @@ def test_pr_column_counts_drafts_apart() -> None:
 
 
 def test_behind_filter_keeps_only_repos_missing_the_remote_tip() -> None:
-    rows = [_row("stale", remote=BEHIND), _row("fresh", remote=CURRENT), _row("mute")]
+    rows = [
+        _row("stale", remote=BEHIND),
+        _row("branch", remote=BEHIND_BRANCH),
+        _row("fresh", remote=CURRENT),
+        _row("mute"),
+    ]
 
     kept = filter_rows(rows, behind_only=True)
 
-    assert [row.state.name for row in kept] == ["stale"]
+    assert [row.state.name for row in kept] == ["stale", "branch"]
 
 
 def test_prs_filter_keeps_only_repos_with_an_open_pr() -> None:
@@ -913,6 +939,22 @@ def test_the_detail_screen_lists_open_prs_and_the_remote_state(
     assert "draft" in prs
     assert "#7" in prs
     assert "/pull/7" in prs
+
+
+def test_the_detail_screen_reports_the_branch_and_the_default_branch(
+    tmp_path: Path,
+) -> None:
+    screen = DetailScreen(
+        _row("repo", remote=BEHIND_BRANCH),
+        _board(tmp_path),
+        clock=lambda: 0.0,
+    )
+
+    remote = screen.remote_content().plain
+
+    assert "origin/fix has commits this branch has not pulled" in remote
+    assert f"remote tip {'e' * 40}" in remote
+    assert "main is current" in remote
 
 
 def test_the_detail_screen_labels_a_repo_off_github_by_its_origin(

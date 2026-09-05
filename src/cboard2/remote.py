@@ -1,21 +1,31 @@
-"""A moved default branch and the user's own open pull requests, read from the origin.
+"""A moved default branch, the checked-out branch and the user's own open pull requests.
 
-``git status --porcelain=v2 --branch`` reports ``behind`` against the local
-remote-tracking ref, so it stays at zero until something fetches. This module
-asks the origin directly instead, and never fetches: a poll that rewrote
-``refs/remotes/origin/*`` under the user would change what their next ``git
-log`` shows.
+All three are read from the origin. ``git status --porcelain=v2 --branch``
+reports ``behind`` against the local remote-tracking ref, so it stays at zero
+until something fetches. This module asks the origin directly instead, and
+never fetches: a poll that rewrote ``refs/remotes/origin/*`` under the user
+would change what their next ``git log`` shows.
 
 Two network calls cover every repo. One batched GraphQL query returns each
-repo's default branch and its tip; one ``gh search prs`` returns every open PR
-the user authored, anywhere. Measured on the author's machine: 66 repos in one
+repo's default branch and its tip, plus the tip of whatever branch is checked
+out in each of its worktrees; one ``gh search prs`` returns every open PR the
+user authored, anywhere. Measured on the author's machine: 66 repos in one
 query took 4.4s, against 1.7s per repo for ``git ls-remote`` — which is why the
 query is batched and why the read runs on its own slow interval rather than the
 2s poll tick.
 
+A branch name reaches that query as a GraphQL variable, never as text spliced
+into it. Git allows a double quote in a branch name, and the query is a string.
+
 An origin that is not on github.com gets ``git ls-remote --symref origin HEAD``
-instead, one call per repo on the same slow clock. It reads refs and writes
-none, so the rule above holds for it too.
+instead, with the same branches named as extra refs, one call per repo on the
+same slow clock. It reads refs and writes none, so the rule above holds for it
+too.
+
+A checkout is compared against the branch its upstream names, or against the
+same name on ``origin`` when it tracks nothing. A branch tracking some other
+remote is left unanswered rather than measured against an origin branch that
+happens to share its name.
 
 The read runs on two clocks. :meth:`RemoteReader.read` asks GitHub on the slow
 one; :meth:`RemoteReader.refresh_local` recomputes whether the answer has been
@@ -80,12 +90,19 @@ BATCH_SIZE = 30
 PR_SEARCH_LIMIT = 100
 """Open PRs the search returns. A user past this has the oldest ones dropped."""
 
+ORIGIN = "origin"
+"""The one remote this module reads. A branch tracking another is left alone."""
+
 _ORIGIN_ARGS = ("remote", "get-url", "origin")
 _LS_REMOTE_ARGS = ("ls-remote", "--symref", "origin", "HEAD")
+_WORKTREES_ARGS = ("worktree", "list", "--porcelain")
 _HEADS_ARGS = (
     "for-each-ref",
     "refs/heads",
-    "--format=%(refname:short)%09%(objectname)",
+    (
+        "--format=%(refname:short)%09%(objectname)"
+        "%09%(upstream:remotename)%09%(upstream:remoteref)"
+    ),
 )
 
 _PR_SEARCH_ARGS = (
@@ -143,9 +160,35 @@ class RemoteState:
     behind_default: bool = False
     """Whether the remote tip is missing from the local default branch.
 
-    The one field here the network does not decide.
-    :meth:`RemoteReader.refresh_local` recomputes it every poll, so a pull
-    clears it without waiting for the next network read.
+    Not decided by the network. :meth:`RemoteReader.refresh_local` recomputes
+    it every poll, so a pull clears it without waiting for the next network
+    read.
+    """
+
+    branch: str | None = None
+    """The branch checked out here when the last read ran.
+
+    Held so a checkout that has moved since is caught: the fields below are
+    about this branch and say nothing about whatever is checked out now.
+    """
+
+    branch_remote: str | None = None
+    """The branch on ``origin`` ``branch`` was compared against, if any.
+
+    None when the checkout is detached, tracks another remote, or is the
+    default branch — that last one is ``behind_default``'s question already.
+    """
+
+    branch_sha: str | None = None
+    """The origin's tip of ``branch_remote``, or None when it has no such branch."""
+
+    branch_known: bool = False
+    """Whether the read reached an origin that could answer about ``branch``."""
+
+    behind_branch: bool = False
+    """Whether the origin's tip of ``branch_remote`` is missing from ``branch``.
+
+    Derived from the local refs on the same clock as ``behind_default``.
     """
 
     @property
@@ -158,6 +201,7 @@ UNKNOWN = RemoteState()
 """The state of a repo no remote read has covered yet."""
 
 _NO_DEFAULTS: Mapping[str, tuple[str, str]] = MappingProxyType({})
+_NO_BRANCHES: Mapping[str, Mapping[str, str]] = MappingProxyType({})
 _NO_PRS: Mapping[str, tuple[PullRequest, ...]] = MappingProxyType({})
 """Empty defaults for :class:`Cached`, immutable so the dataclass accepts them."""
 
@@ -166,14 +210,22 @@ _NO_PRS: Mapping[str, tuple[PullRequest, ...]] = MappingProxyType({})
 class Cached:
     """One remote read, in the shape that survives between processes.
 
-    Only what the network decided. ``behind_default`` is absent on purpose: it
-    comes from the local refs, so a stored copy would keep reporting
-    ``behind main`` after a pull.
+    Only what the network decided. The two behind markers are absent on
+    purpose: they come from the local refs, so a stored copy would keep
+    reporting ``behind main`` after a pull.
     """
 
     read_at: float
     defaults: Mapping[str, tuple[str, str]] = _NO_DEFAULTS
     """Slug to its default branch name and tip sha."""
+
+    branches: Mapping[str, Mapping[str, str]] = _NO_BRANCHES
+    """Slug to the tip of each branch the read asked about by name.
+
+    Stored so a restart inside the read interval still knows where the origin's
+    copy of the checked-out branch stood, rather than waiting out the interval
+    with the column blank.
+    """
 
     prs: Mapping[str, tuple[PullRequest, ...]] = _NO_PRS
     prs_known: bool = False
@@ -292,25 +344,111 @@ def parse_heads(text: str) -> dict[str, str]:
     """Parse ``for-each-ref refs/heads`` output into branch name to sha."""
     heads: dict[str, str] = {}
     for line in text.splitlines():
-        name, tab, sha = line.partition("\t")
-        if tab and name and sha:
-            heads[name] = sha
+        fields = line.split("\t")
+        if len(fields) >= 2 and fields[0] and fields[1]:
+            heads[fields[0]] = fields[1]
     return heads
 
 
-def build_query(slugs: Sequence[str]) -> str:
-    """Return a GraphQL query aliasing one default-branch lookup per slug.
+def parse_upstreams(text: str) -> dict[str, tuple[str, str]]:
+    """Parse the same output into branch name to its remote's name and ref.
 
-    The alias is the slug's index, because a slug is not a legal GraphQL name.
-    :func:`parse_defaults` reads the index back out.
+    A branch tracking nothing has both fields empty and is left out, which
+    reads the same as a branch git never mentioned.
     """
+    found: dict[str, tuple[str, str]] = {}
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 4 and fields[0] and fields[2] and fields[3]:
+            found[fields[0]] = (fields[2], fields[3])
+    return found
+
+
+def parse_worktrees(text: str) -> dict[str, str]:
+    """Parse ``worktree list --porcelain`` into worktree path to branch name.
+
+    A detached worktree has no ``branch`` line and is left out. The paths git
+    prints here are resolved, so a caller matching them resolves its own.
+    """
+    found: dict[str, str] = {}
+    path: str | None = None
+    for line in text.splitlines():
+        if line.startswith("worktree "):
+            path = line.removeprefix("worktree ").strip() or None
+        elif line.startswith("branch ") and path is not None:
+            ref = line.removeprefix("branch ").strip()
+            if ref.startswith("refs/heads/"):
+                found[path] = ref.removeprefix("refs/heads/")
+    return found
+
+
+def parse_ref_shas(text: str) -> dict[str, str]:
+    """Read the ``refs/heads`` lines of ls-remote output as branch name to sha."""
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        sha, tab, ref = line.partition("\t")
+        name = ref.strip()
+        if tab and sha.strip() and name.startswith("refs/heads/"):
+            found[name.removeprefix("refs/heads/")] = sha.strip()
+    return found
+
+
+def target_branch(branch: str | None, upstream: tuple[str, str] | None) -> str | None:
+    """Return the branch on ``origin`` ``branch`` should be compared against.
+
+    A branch tracking nothing falls back to its own name, which is the branch
+    a push would create. One tracking another remote returns None: an origin
+    branch of the same name is a different line of work.
+    """
+    if branch is None:
+        return None
+    if upstream is None:
+        return branch
+    remote, ref = upstream
+    if remote != ORIGIN or not ref.startswith("refs/heads/"):
+        return None
+    return ref.removeprefix("refs/heads/") or None
+
+
+def build_query(slugs: Sequence[str], pairs: Sequence[tuple[str, str]] = ()) -> str:
+    """Return a GraphQL query for each slug's default branch and named branches.
+
+    ``pairs`` are the ``(slug, branch)`` lookups to add, each nested under its
+    slug as a ``b<index>`` alias reading the variable of the same name.
+    :func:`parse_defaults` and :func:`parse_branch_tips` read both indexes back
+    out, and the slug's own index is its alias because a slug is not a legal
+    GraphQL name.
+    """
+    refs: dict[str, list[str]] = {}
+    for index, (slug, _) in enumerate(pairs):
+        refs.setdefault(slug, []).append(
+            f"b{index}: ref(qualifiedName: $b{index}) {{ target {{ oid }} }}",
+        )
     lines = [
         f'  r{index}: repository(owner: "{slug.split("/")[0]}", '
         f'name: "{slug.split("/")[1]}") '
-        "{ defaultBranchRef { name target { oid } } }"
+        "{ defaultBranchRef { name target { oid } }"
+        + "".join(f" {lookup}" for lookup in refs.get(slug, ()))
+        + " }"
         for index, slug in enumerate(slugs)
     ]
-    return "{\n" + "\n".join(lines) + "\n}"
+    header = ""
+    if pairs:
+        declared = ", ".join(f"$b{index}: String!" for index in range(len(pairs)))
+        header = f"query({declared}) "
+    return header + "{\n" + "\n".join(lines) + "\n}"
+
+
+def branch_variables(pairs: Sequence[tuple[str, str]]) -> tuple[str, ...]:
+    """Return the gh arguments binding each pair's branch to its query variable.
+
+    Bound as a variable rather than written into the query text: git allows a
+    double quote in a branch name, and the query is a string.
+    """
+    args: list[str] = []
+    for index, (_, branch) in enumerate(pairs):
+        args += ["-f", f"b{index}=refs/heads/{branch}"]
+    return tuple(args)
 
 
 def parse_defaults(text: str, slugs: Sequence[str]) -> dict[str, tuple[str, str]]:
@@ -331,6 +469,31 @@ def parse_defaults(text: str, slugs: Sequence[str]) -> dict[str, tuple[str, str]
         oid = _as_dict(ref.get("target")).get("oid")
         if isinstance(name, str) and isinstance(oid, str):
             found[slug] = (name, oid)
+    return found
+
+
+def parse_branch_tips(
+    text: str,
+    slugs: Sequence[str],
+    pairs: Sequence[tuple[str, str]],
+) -> dict[str, dict[str, str]]:
+    """Map each pair's slug and branch to the tip the query returned for it.
+
+    A branch the origin does not have resolves to null and is left out, which
+    the caller reads as no branch to be behind of rather than as no answer.
+    """
+    payload = _as_dict(_load(text))
+    data = _as_dict(payload.get("data"))
+    if not data:
+        return {}
+
+    aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
+    found: dict[str, dict[str, str]] = {}
+    for index, (slug, branch) in enumerate(pairs):
+        repo = _as_dict(data.get(aliases.get(slug, "")))
+        oid = _as_dict(_as_dict(repo.get(f"b{index}")).get("target")).get("oid")
+        if isinstance(oid, str):
+            found.setdefault(slug, {})[branch] = oid
     return found
 
 
@@ -407,9 +570,10 @@ class RemoteReader:
     """Holds the last remote reading per repo, refreshed on a slow interval.
 
     :meth:`read` is the only method that touches the network.
-    :meth:`refresh_local` re-derives ``behind_default`` from the local refs and
-    is cheap enough for every poll: measured on the author's machine, one
-    ``for-each-ref`` across 75 repos takes 0.1s at 16 workers.
+    :meth:`refresh_local` re-derives both behind markers from the local refs
+    and is cheap enough for every poll: measured on the author's machine, one
+    ``for-each-ref`` across 75 repos takes 0.1s at 16 workers, and the
+    ``worktree list`` beside it costs about the same.
     """
 
     def __init__(
@@ -465,14 +629,16 @@ class RemoteReader:
             return False
 
         origins = self._origins(repos)
-        self._states = {
-            repo.path: self._state(
-                origin=origins.get(repo.path),
-                defaults=cached.defaults,
-                prs=cached.prs if cached.prs_known else None,
-            )
-            for repo in repos
-        }
+        checkouts = self._checkouts(repos)
+        self._rebuild(
+            repos,
+            origins=origins,
+            defaults=cached.defaults,
+            tips=cached.branches,
+            prs=cached.prs if cached.prs_known else None,
+            checkouts=checkouts,
+            targets=self._targets(repos, checkouts, self._ref_lines(repos)),
+        )
         self._read_at = cached.read_at
         self.refresh_local(repos)
         return True
@@ -484,36 +650,71 @@ class RemoteReader:
         *,
         force: bool = False,
     ) -> bool:
-        """Ask every origin about its default branch, and report whether it ran.
+        """Ask every origin about its branches, and report whether the call ran.
 
-        Returns False without a network call when the interval has not elapsed
-        and ``force`` is unset. Finishes by calling :meth:`refresh_local`, so
-        the states this leaves behind are already current against the tree.
+        Each origin is asked for its default branch and for whatever branch is
+        checked out in the repo and its worktrees. Returns False without a
+        network call when the interval has not elapsed and ``force`` is unset.
+        Finishes by calling :meth:`refresh_local`, so the states this leaves
+        behind are already current against the tree.
         """
         if not (force or self.due(now)):
             return False
 
         origins = self._origins(repos)
-        defaults = self._defaults(github_slugs(origins.values()))
-        defaults.update(self._probe(repos, origins))
+        checkouts = self._checkouts(repos)
+        lines = self._ref_lines(repos)
+        targets = self._targets(repos, checkouts, lines)
+        wanted = self._wanted(repos, origins, targets)
+
+        defaults, tips = self._defaults(github_slugs(origins.values()), wanted)
+        probed, probed_tips = self._probe(repos, origins, wanted)
+        defaults.update(probed)
+        tips.update(probed_tips)
         prs = self._prs()
 
+        self._rebuild(
+            repos,
+            origins=origins,
+            defaults=defaults,
+            tips=tips,
+            prs=prs,
+            checkouts=checkouts,
+            targets=targets,
+        )
+        self._read_at = now
+        self._apply(self._covered(repos), lines, checkouts)
+        self._store(defaults, tips, prs, now)
+        return True
+
+    def _rebuild(
+        self,
+        repos: Sequence[Repo],
+        *,
+        origins: Mapping[Path, str],
+        defaults: Mapping[str, tuple[str, str]],
+        tips: Mapping[str, Mapping[str, str]],
+        prs: Mapping[str, tuple[PullRequest, ...]] | None,
+        checkouts: Mapping[Path, str],
+        targets: Mapping[Path, str],
+    ) -> None:
+        """Replace every state from one set of answers, network or cached."""
         self._states = {
             repo.path: self._state(
                 origin=origins.get(repo.path),
                 defaults=defaults,
+                tips=tips,
                 prs=prs,
+                branch=checkouts.get(repo.path),
+                target=targets.get(repo.path),
             )
             for repo in repos
         }
-        self._read_at = now
-        self.refresh_local(repos)
-        self._store(defaults, prs, now)
-        return True
 
     def _store(
         self,
         defaults: dict[str, tuple[str, str]],
+        tips: dict[str, dict[str, str]],
         prs: dict[str, tuple[PullRequest, ...]] | None,
         now: float,
     ) -> None:
@@ -528,63 +729,130 @@ class RemoteReader:
             Cached(
                 read_at=now,
                 defaults=defaults,
+                branches=tips,
                 prs={} if prs is None else prs,
                 prs_known=prs is not None,
             ),
         )
 
     def refresh_local(self, repos: Sequence[Repo]) -> None:
-        """Recompute ``behind_default`` against the local refs, making no network call.
+        """Recompute both behind markers against the local refs, making no network call.
 
         Called on every poll. A pull moves ``refs/heads/main`` without telling
         GitHub anything, so the answer has to be re-derived on the fast clock
-        or the column keeps reporting a state the user has already fixed.
+        or the column keeps reporting a state the user has already fixed. A
+        checkout onto another branch is caught here too.
         """
-        known = [
+        known = self._covered(repos)
+        if not known:
+            return
+        self._apply(known, self._ref_lines(known), self._checkouts(known))
+
+    def _covered(self, repos: Sequence[Repo]) -> list[Repo]:
+        """Return the repos a read has already answered for."""
+        return [
             repo
             for repo in repos
             if self._states.get(repo.path, UNKNOWN).default_sha is not None
         ]
-        if not known:
-            return
 
-        heads = self._heads(known)
+    def _apply(
+        self,
+        known: Sequence[Repo],
+        lines: Mapping[Path, str],
+        checkouts: Mapping[Path, str],
+    ) -> None:
+        """Recompute both behind markers for every repo a read has answered for."""
+        heads = {family: parse_heads(text) for family, text in lines.items()}
         for repo in known:
             state = self._states[repo.path]
-            behind = self._behind(
+            fresh = self._rederive(
                 repo,
+                state,
                 heads.get(repo.family, {}),
-                state.default_branch,
-                state.default_sha,
+                checkouts.get(repo.path),
             )
-            if behind != state.behind_default:
-                self._states[repo.path] = replace(state, behind_default=behind)
+            if fresh != state:
+                self._states[repo.path] = fresh
+
+    def _rederive(
+        self,
+        repo: Repo,
+        state: RemoteState,
+        heads: dict[str, str],
+        checkout: str | None,
+    ) -> RemoteState:
+        """Return ``state`` with both behind markers recomputed from the local refs.
+
+        A checkout that has moved since the read drops the branch answer
+        entirely: it was about the branch that was here then, and the next
+        network read is what fills the new one in.
+        """
+        behind_default = self._behind(
+            repo,
+            heads,
+            state.default_branch,
+            state.default_sha,
+        )
+        if checkout != state.branch:
+            return replace(
+                state,
+                behind_default=behind_default,
+                branch=checkout,
+                branch_remote=None,
+                branch_sha=None,
+                branch_known=False,
+                behind_branch=False,
+            )
+        return replace(
+            state,
+            behind_default=behind_default,
+            behind_branch=self._behind(repo, heads, state.branch, state.branch_sha),
+        )
 
     def _state(
         self,
         *,
         origin: str | None,
         defaults: Mapping[str, tuple[str, str]],
+        tips: Mapping[str, Mapping[str, str]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
+        branch: str | None,
+        target: str | None,
     ) -> RemoteState:
-        """Assemble one repo's network facts. ``behind_default`` is left to later.
+        """Assemble one repo's network facts. Both behind markers are left to later.
 
         A repo off GitHub reports its PRs known and empty: no search could have
         found one, so an unread marker would promise an answer that never comes.
+        A checkout of the default branch keeps no branch answer either, because
+        ``behind_default`` already carries that comparison.
         """
         if origin is None:
             return UNKNOWN
         slug = parse_slug(origin)
-        default = defaults.get(slug or origin)
-        branch, sha = default or (None, None)
+        key = slug or origin
+        default = defaults.get(key)
+        default_branch, sha = default or (None, None)
+        answered = default is not None
+        remote_branch = (
+            target
+            if answered and target is not None and target != default_branch
+            else None
+        )
         return RemoteState(
             origin=origin,
             slug=slug,
-            default_branch=branch,
+            default_branch=default_branch,
             default_sha=sha,
-            default_known=default is not None,
+            default_known=answered,
             prs=() if slug is None or prs is None else prs.get(slug, ()),
             prs_known=slug is None or prs is not None,
+            branch=branch,
+            branch_remote=remote_branch,
+            branch_sha=(
+                None if remote_branch is None else tips.get(key, {}).get(remote_branch)
+            ),
+            branch_known=remote_branch is not None,
         )
 
     def _behind(
@@ -644,52 +912,143 @@ class RemoteReader:
         self,
         repos: Sequence[Repo],
         origins: Mapping[Path, str],
-    ) -> dict[str, tuple[str, str]]:
-        """Ask the origins GitHub cannot answer for what their HEAD points at.
+        wanted: Mapping[str, Sequence[str]],
+    ) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+        """Ask the origins GitHub cannot answer about HEAD and the named branches.
 
         Keyed by URL rather than by path, which is the same key the GraphQL
-        answers use and never collides with an ``owner/name``.
+        answers use and never collides with an ``owner/name``. One call carries
+        both questions, because a second would be a second ssh handshake.
         """
-        targets = [
+        elsewhere = [
             repo
             for repo in leaders(repos)
             if (url := origins.get(repo.path)) is not None and parse_slug(url) is None
         ]
 
-        def probe(repo: Repo) -> tuple[str, tuple[str, str] | None]:
-            out = self._ls_remote(repo.path, _LS_REMOTE_ARGS)
-            return origins[repo.path], None if out is None else parse_symref(out)
+        def probe(repo: Repo) -> tuple[str, tuple[str, str] | None, dict[str, str]]:
+            url = origins[repo.path]
+            args = (
+                *_LS_REMOTE_ARGS,
+                *(f"refs/heads/{name}" for name in wanted.get(url, ())),
+            )
+            out = self._ls_remote(repo.path, args)
+            if out is None:
+                return url, None, {}
+            return url, parse_symref(out), parse_ref_shas(out)
 
-        return {
-            url: found for url, found in self._map(probe, targets) if found is not None
-        }
+        defaults: dict[str, tuple[str, str]] = {}
+        tips: dict[str, dict[str, str]] = {}
+        for url, default, found in self._map(probe, elsewhere):
+            if default is not None:
+                defaults[url] = default
+            if found:
+                tips[url] = found
+        return defaults, tips
 
-    def _heads(self, repos: Sequence[Repo]) -> dict[Path, dict[str, str]]:
-        """Read the local branch tips once per family, keyed by family."""
+    def _checkouts(self, repos: Sequence[Repo]) -> dict[Path, str]:
+        """Return the branch checked out at each path, read once per family.
 
-        def heads(repo: Repo) -> tuple[Path, dict[str, str]]:
-            out = self._runner(repo.path, _HEADS_ARGS)
-            return repo.family, {} if out is None else parse_heads(out)
+        ``worktree list`` answers for a repo and all its worktrees at once, so
+        this costs one git call per family rather than one per row. Git prints
+        resolved paths, so a row reached through a symlink is looked up under
+        both spellings.
+        """
 
-        return dict(self._map(heads, leaders(repos)))
+        def listing(repo: Repo) -> tuple[Path, dict[str, str]]:
+            out = self._runner(repo.path, _WORKTREES_ARGS)
+            return repo.family, {} if out is None else parse_worktrees(out)
 
-    def _defaults(self, slugs: Sequence[str]) -> dict[str, tuple[str, str]]:
-        """Run the batched default-branch query and merge every chunk's answer."""
+        by_family = dict(self._map(listing, leaders(repos)))
+        found: dict[Path, str] = {}
+        for repo in repos:
+            listed = by_family.get(repo.family, {})
+            branch = listed.get(str(repo.path)) or listed.get(str(repo.path.resolve()))
+            if branch is not None:
+                found[repo.path] = branch
+        return found
+
+    def _ref_lines(self, repos: Sequence[Repo]) -> dict[Path, str]:
+        """Read each family's branch tips and upstreams once, unparsed.
+
+        Handed on as text because two callers want different fields out of it,
+        and a second ``for-each-ref`` would be the same answer read twice.
+        """
+
+        def refs(repo: Repo) -> tuple[Path, str]:
+            return repo.family, self._runner(repo.path, _HEADS_ARGS) or ""
+
+        return dict(self._map(refs, leaders(repos)))
+
+    def _targets(
+        self,
+        repos: Sequence[Repo],
+        checkouts: Mapping[Path, str],
+        lines: Mapping[Path, str],
+    ) -> dict[Path, str]:
+        """Return the origin branch each checkout should be compared against."""
+        upstreams = {family: parse_upstreams(text) for family, text in lines.items()}
+        found: dict[Path, str] = {}
+        for repo in repos:
+            branch = checkouts.get(repo.path)
+            if branch is None:
+                continue
+            target = target_branch(branch, upstreams.get(repo.family, {}).get(branch))
+            if target is not None:
+                found[repo.path] = target
+        return found
+
+    def _wanted(
+        self,
+        repos: Sequence[Repo],
+        origins: Mapping[Path, str],
+        targets: Mapping[Path, str],
+    ) -> dict[str, list[str]]:
+        """Group the branches to ask about by the remote that can answer for them.
+
+        Two worktrees of one repo sitting on one branch ask once, and a branch
+        checked out in two clones of the same repo asks once too.
+        """
+        wanted: dict[str, set[str]] = {}
+        for repo in repos:
+            url = origins.get(repo.path)
+            target = targets.get(repo.path)
+            if url is None or target is None:
+                continue
+            wanted.setdefault(parse_slug(url) or url, set()).add(target)
+        return {key: sorted(names) for key, names in wanted.items()}
+
+    def _defaults(
+        self,
+        slugs: Sequence[str],
+        wanted: Mapping[str, Sequence[str]],
+    ) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+        """Run the batched query and merge every chunk's defaults and branch tips."""
         if not slugs:
-            return {}
+            return {}, {}
         chunks = [
             tuple(slugs[start : start + BATCH_SIZE])
             for start in range(0, len(slugs), BATCH_SIZE)
         ]
 
-        def lookup(chunk: tuple[str, ...]) -> dict[str, tuple[str, str]]:
-            out = self._gh(("api", "graphql", "-f", f"query={build_query(chunk)}"))
-            return {} if out is None else parse_defaults(out, chunk)
+        def lookup(
+            chunk: tuple[str, ...],
+        ) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+            pairs = [(slug, name) for slug in chunk for name in wanted.get(slug, ())]
+            query = build_query(chunk, pairs)
+            out = self._gh(
+                ("api", "graphql", "-f", f"query={query}", *branch_variables(pairs)),
+            )
+            if out is None:
+                return {}, {}
+            return parse_defaults(out, chunk), parse_branch_tips(out, chunk, pairs)
 
         merged: dict[str, tuple[str, str]] = {}
-        for found in self._map(lookup, chunks):
+        tips: dict[str, dict[str, str]] = {}
+        for found, branches in self._map(lookup, chunks):
             merged.update(found)
-        return merged
+            tips.update(branches)
+        return merged, tips
 
     def _prs(self) -> dict[str, tuple[PullRequest, ...]] | None:
         """Run the one search that covers every repo, or return None on failure."""

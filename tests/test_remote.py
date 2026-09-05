@@ -1,4 +1,4 @@
-"""Tests for the GitHub read: default-branch staleness and the user's own PRs."""
+"""Tests for the remote read: branch staleness and the user's own open PRs."""
 
 from __future__ import annotations
 
@@ -14,14 +14,20 @@ from cboard2.remote import (
     Cached,
     PullRequest,
     RemoteReader,
+    branch_variables,
     build_query,
     github_slugs,
+    parse_branch_tips,
     parse_defaults,
     parse_heads,
     parse_prs,
+    parse_ref_shas,
     parse_slug,
     parse_symref,
+    parse_upstreams,
+    parse_worktrees,
     run_gh,
+    target_branch,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +93,34 @@ def _worktree(root: Path, name: str, main: Repo) -> Repo:
         dormant=False,
         main_git_dir=main.path / ".git",
     )
+
+
+def _heads(*rows: tuple[str, str, str, str]) -> str:
+    """Build ``for-each-ref`` output: branch, sha, upstream remote and its ref."""
+    return "".join(
+        f"{name}\t{sha}\t{remote}\t{ref}\n" for name, sha, remote, ref in rows
+    )
+
+
+def _listing(*entries: tuple[Path, str | None]) -> str:
+    """Build ``worktree list --porcelain`` output; a None branch reads as detached."""
+    return "\n".join(
+        f"worktree {path}\nHEAD {LOCAL_SHA}\n"
+        + (f"branch refs/heads/{branch}\n" if branch else "detached\n")
+        for path, branch in entries
+    )
+
+
+def _graphql_refs(default: tuple[str, str] | None, **refs: str) -> str:
+    """Build a one-repo response: its default branch and its ``b<n>`` ref tips."""
+    entry: dict[str, object] = {
+        "defaultBranchRef": None
+        if default is None
+        else {"name": default[0], "target": {"oid": default[1]}},
+    }
+    for alias, oid in refs.items():
+        entry[alias] = {"target": {"oid": oid}}
+    return json.dumps({"data": {"r0": entry}})
 
 
 def _graphql(*entries: tuple[str, str] | None) -> str:
@@ -937,3 +971,418 @@ def test_a_worktree_without_its_repo_resolves_on_its_own(tmp_path: Path) -> None
 
     assert reader.cached(side.path).slug == "acme/one"
     assert reader.cached(side.path).behind_default is False
+
+
+def test_parse_heads_ignores_the_upstream_fields() -> None:
+    text = _heads(("main", LOCAL_SHA, "origin", "refs/heads/main"))
+
+    assert parse_heads(text) == {"main": LOCAL_SHA}
+
+
+def test_parse_upstreams_reads_the_remote_and_the_ref_it_tracks() -> None:
+    text = _heads(
+        ("main", LOCAL_SHA, "origin", "refs/heads/main"),
+        ("fix", LOCAL_SHA, "upstream", "refs/heads/fix"),
+        ("spike", LOCAL_SHA, "", ""),
+    )
+
+    assert parse_upstreams(text) == {
+        "main": ("origin", "refs/heads/main"),
+        "fix": ("upstream", "refs/heads/fix"),
+    }
+
+
+def test_parse_worktrees_maps_each_path_to_its_branch(tmp_path: Path) -> None:
+    text = _listing(
+        (tmp_path / "one", "main"),
+        (tmp_path / "one-side", "side"),
+        (tmp_path / "one-bisect", None),
+    )
+
+    assert parse_worktrees(text) == {
+        str(tmp_path / "one"): "main",
+        str(tmp_path / "one-side"): "side",
+    }
+
+
+def test_parse_ref_shas_reads_only_branch_refs() -> None:
+    text = (
+        f"ref: refs/heads/main\tHEAD\n"
+        f"{REMOTE_SHA}\tHEAD\n"
+        f"{REMOTE_SHA}\trefs/heads/fix\n"
+        f"{LOCAL_SHA}\trefs/tags/v1\n"
+    )
+
+    assert parse_ref_shas(text) == {"fix": REMOTE_SHA}
+
+
+@pytest.mark.parametrize(
+    ("branch", "upstream", "expected"),
+    [
+        ("fix", None, "fix"),
+        ("fix", ("origin", "refs/heads/fix"), "fix"),
+        ("fix", ("origin", "refs/heads/their-fix"), "their-fix"),
+        ("fix", ("upstream", "refs/heads/fix"), None),
+        ("fix", ("origin", "refs/pull/7/head"), None),
+        (None, None, None),
+    ],
+)
+def test_target_branch_follows_the_upstream_only_on_origin(
+    branch: str | None,
+    upstream: tuple[str, str] | None,
+    expected: str | None,
+) -> None:
+    assert target_branch(branch, upstream) == expected
+
+
+def test_build_query_binds_each_branch_to_a_variable() -> None:
+    pairs = [("acme/one", "fix"), ("acme/two", 'odd"name')]
+
+    query = build_query(("acme/one", "acme/two"), pairs)
+
+    assert query.startswith("query($b0: String!, $b1: String!) {")
+    assert "b0: ref(qualifiedName: $b0)" in query
+    assert "b1: ref(qualifiedName: $b1)" in query
+    assert 'odd"name' not in query
+    assert branch_variables(pairs) == (
+        "-f",
+        "b0=refs/heads/fix",
+        "-f",
+        'b1=refs/heads/odd"name',
+    )
+
+
+def test_build_query_without_branches_is_the_query_it_always_was() -> None:
+    assert build_query(("acme/one",)) == build_query(("acme/one",), [])
+
+
+def test_parse_branch_tips_round_trips_a_built_query() -> None:
+    slugs = ("acme/one",)
+    pairs = [("acme/one", "fix"), ("acme/one", "gone")]
+    text = _graphql_refs(("main", LOCAL_SHA), b0=REMOTE_SHA)
+
+    assert parse_branch_tips(text, slugs, pairs) == {"acme/one": {"fix": REMOTE_SHA}}
+
+
+def _branch_git(
+    repo: Repo, *, branch: str = "fix", merge_base: str | None = None
+) -> FakeGit:
+    """Build a runner for a repo sitting on ``branch`` with ``main`` current."""
+    return FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, branch)),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                    (branch, LOCAL_SHA, "origin", f"refs/heads/{branch}"),
+                ),
+                "merge-base": merge_base,
+            },
+        },
+    )
+
+
+def test_a_branch_missing_the_origin_tip_is_behind(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo)  # merge-base fails: the branch lacks the origin tip
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([repo], NOW) is True
+
+    state = reader.cached(repo.path)
+    assert state.branch == "fix"
+    assert state.branch_remote == "fix"
+    assert state.branch_sha == REMOTE_SHA
+    assert state.branch_known is True
+    assert state.behind_branch is True
+    assert state.behind_default is False
+
+
+def test_a_branch_ahead_of_the_origin_is_not_behind(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo, merge_base="")  # the branch already holds the origin tip
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    assert reader.cached(repo.path).behind_branch is False
+    assert reader.cached(repo.path).branch_known is True
+
+
+def test_a_branch_level_with_the_origin_asks_no_merge_base(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, "fix")),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                    ("fix", REMOTE_SHA, "origin", "refs/heads/fix"),
+                ),
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    assert reader.cached(repo.path).behind_branch is False
+    assert [args[0] for _, args in git.calls].count("merge-base") == 0
+
+
+def test_a_branch_the_origin_does_not_have_is_not_behind(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo, branch="spike")
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.branch_remote == "spike"
+    assert state.branch_sha is None
+    assert state.branch_known is True
+    assert state.behind_branch is False
+
+
+def test_a_renamed_upstream_is_asked_about_under_the_origins_name(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, "fix")),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                    ("fix", LOCAL_SHA, "origin", "refs/heads/their-fix"),
+                ),
+                "merge-base": None,
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    assert "b0=refs/heads/their-fix" in gh.calls[0]
+    state = reader.cached(repo.path)
+    assert state.branch_remote == "their-fix"
+    assert state.behind_branch is True
+
+
+def test_a_branch_tracking_another_remote_is_left_unanswered(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, "fix")),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                    ("fix", LOCAL_SHA, "upstream", "refs/heads/fix"),
+                ),
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.branch == "fix"
+    assert state.branch_remote is None
+    assert state.branch_known is False
+    assert state.behind_branch is False
+    assert "b0" not in gh.calls[0][3]
+
+
+def test_a_detached_checkout_has_no_branch_answer(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, None)),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main")
+                ),
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.branch is None
+    assert state.branch_known is False
+    assert state.behind_branch is False
+
+
+def test_a_checkout_of_the_default_branch_keeps_the_default_answer(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo, branch="main")
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.branch == "main"
+    assert state.branch_remote is None
+    assert state.branch_known is False
+    assert state.behind_branch is False
+    assert state.behind_default is True  # the answer the default column carries
+
+
+def test_an_origin_that_could_not_be_read_leaves_the_branch_unknown(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo)
+    reader = RemoteReader(runner=git, gh=FakeGh(graphql=None, prs=None))
+    reader.read([repo], NOW)
+
+    state = reader.cached(repo.path)
+    assert state.default_known is False
+    assert state.branch_known is False
+    assert state.behind_branch is False
+
+
+def test_an_offsite_origin_is_asked_about_the_branch_in_the_same_call(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": f"{SSH_ORIGIN}\n",
+                "worktree": _listing((repo.path, "fix")),
+                "for-each-ref": _heads(
+                    ("trunk", REMOTE_SHA, "origin", "refs/heads/trunk"),
+                    ("fix", LOCAL_SHA, "origin", "refs/heads/fix"),
+                ),
+                "merge-base": None,
+            },
+        },
+    )
+    probe = FakeGit(
+        {repo.path: {"ls-remote": f"{SYMREF}{REMOTE_SHA}\trefs/heads/fix\n"}},
+    )
+    reader = RemoteReader(
+        runner=git,
+        ls_remote=probe,
+        gh=FakeGh(graphql=None, prs=None),
+    )
+    reader.read([repo], NOW)
+
+    assert len(probe.calls) == 1
+    assert probe.calls[0][1][-1] == "refs/heads/fix"
+    state = reader.cached(repo.path)
+    assert state.default_branch == "trunk"
+    assert state.branch_remote == "fix"
+    assert state.behind_branch is True
+
+
+def test_a_checkout_that_moved_since_the_read_drops_the_branch_answer(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    answers = {
+        repo.path: {
+            "remote": "https://github.com/acme/one.git\n",
+            "worktree": _listing((repo.path, "fix")),
+            "for-each-ref": _heads(
+                ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                ("fix", LOCAL_SHA, "origin", "refs/heads/fix"),
+            ),
+            "merge-base": None,
+        },
+    }
+    git = FakeGit(answers)
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    assert reader.cached(repo.path).behind_branch is True
+
+    answers[repo.path]["worktree"] = _listing((repo.path, "other"))
+    reader.refresh_local([repo])
+
+    state = reader.cached(repo.path)
+    assert state.branch == "other"
+    assert state.branch_remote is None
+    assert state.branch_known is False
+    assert state.behind_branch is False
+
+
+def test_two_worktrees_ask_about_both_branches_in_one_query(tmp_path: Path) -> None:
+    main = _repo(tmp_path, "one")
+    side = _worktree(tmp_path, "one-side", main)
+    git = FakeGit(
+        {
+            main.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((main.path, "fix"), (side.path, "spike")),
+                "for-each-ref": _heads(
+                    ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                    ("fix", LOCAL_SHA, "origin", "refs/heads/fix"),
+                    ("spike", LOCAL_SHA, "", ""),
+                ),
+                "merge-base": None,
+            },
+        },
+    )
+    gh = FakeGh(
+        graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA, b1=REMOTE_SHA),
+        prs="[]",
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([main, side], NOW)
+
+    assert "b0=refs/heads/fix" in gh.calls[0]
+    assert "b1=refs/heads/spike" in gh.calls[0]
+    assert [args[0] for _, args in git.calls].count("worktree") == 1
+    assert reader.cached(main.path).branch_remote == "fix"
+    assert reader.cached(side.path).branch_remote == "spike"
+    assert reader.cached(side.path).behind_branch is True
+
+
+def test_the_branch_tips_reach_the_cache(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo)
+    gh = FakeGh(graphql=_graphql_refs(("main", REMOTE_SHA), b0=REMOTE_SHA), prs="[]")
+    saved: list[Cached] = []
+    reader = RemoteReader(
+        runner=git, gh=gh, save=lambda cached: bool(saved.append(cached))
+    )
+    reader.read([repo], NOW)
+
+    assert dict(saved[0].branches) == {"acme/one": {"fix": REMOTE_SHA}}
+
+
+def test_prime_serves_the_stored_branch_tips(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = _branch_git(repo)
+    stored = Cached(
+        read_at=NOW - 60.0,
+        defaults={"acme/one": ("main", REMOTE_SHA)},
+        branches={"acme/one": {"fix": REMOTE_SHA}},
+    )
+    reader = RemoteReader(
+        300.0,
+        runner=git,
+        gh=FakeGh(graphql=None, prs=None),
+        load=lambda: stored,
+    )
+
+    assert reader.prime([repo]) is True
+
+    state = reader.cached(repo.path)
+    assert state.branch_remote == "fix"
+    assert state.behind_branch is True

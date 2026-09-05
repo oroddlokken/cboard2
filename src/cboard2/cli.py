@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from cboard2.board import Board
 from cboard2.config import ConfigError, load_config
 from cboard2.duration import parse_duration
+from cboard2.remote import ORIGIN
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -180,6 +181,10 @@ def _remote_dict(row: Row) -> dict[str, object]:
         "default_sha": remote.default_sha,
         "default_known": remote.default_known,
         "behind_default": remote.behind_default,
+        "branch_remote": remote.branch_remote,
+        "branch_sha": remote.branch_sha,
+        "branch_known": remote.branch_known,
+        "behind_branch": remote.behind_branch,
         "prs_known": remote.prs_known,
         "prs": [
             {
@@ -224,8 +229,14 @@ def _cells(row: Row, now: float, *, remote: bool) -> tuple[str, ...]:
 
 
 def remote_text(row: Row) -> str:
-    """Return whether the remote's newest default-branch commit is here yet."""
+    """Return which branch has commits on the origin this clone has not pulled.
+
+    The checked-out branch is reported ahead of the default branch, because it
+    is the one the user is standing on.
+    """
     state = row.remote
+    if state.behind_branch:
+        return f"behind {ORIGIN}/{state.branch_remote}"
     if not state.default_known:
         return "?"
     if state.behind_default:

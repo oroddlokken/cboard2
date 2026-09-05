@@ -227,14 +227,14 @@ def test_relative_renders_an_age(seconds: float, expected: str) -> None:
     assert relative(seconds) == expected
 
 
-def _graphql(branch: str, oid: str) -> str:
-    return json.dumps(
-        {
-            "data": {
-                "r0": {"defaultBranchRef": {"name": branch, "target": {"oid": oid}}}
-            }
-        },
-    )
+def _graphql(branch: str, oid: str, tip: str | None = None) -> str:
+    """Build a one-repo answer, with ``tip`` as the ``b0`` branch lookup."""
+    entry: dict[str, object] = {
+        "defaultBranchRef": {"name": branch, "target": {"oid": oid}},
+    }
+    if tip is not None:
+        entry["b0"] = {"target": {"oid": tip}}
+    return json.dumps({"data": {"r0": entry}})
 
 
 def test_bare_ls_leaves_the_remote_columns_out(
@@ -290,6 +290,22 @@ def test_remote_flag_adds_the_two_columns(
     assert [args[0] for args in gh.calls] == ["api", "search"]
 
 
+def test_the_remote_column_names_a_branch_behind_its_origin_copy(
+    git_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    git(git_repo, "checkout", "-q", "-b", "fix")
+    gh = _RecordingGh({"api": _graphql("main", "f" * 40, "e" * 40), "search": "[]"})
+    board = _remote_board(git_repo.parent, gh)
+    board.rescan()
+    assert board.read_remote(force=True) is True
+
+    assert cmd_ls(board, None, now=NOW, remote=True) == 0
+
+    assert "behind origin/fix" in capsys.readouterr().out.splitlines()[1]
+
+
 def test_a_disabled_remote_config_makes_no_call(git_repo: Path) -> None:
     gh = _RecordingGh({})
     board = _board(git_repo.parent)
@@ -315,6 +331,10 @@ def test_json_always_carries_the_remote_object(
         "default_sha": None,
         "default_known": False,
         "behind_default": False,
+        "branch_remote": None,
+        "branch_sha": None,
+        "branch_known": False,
+        "behind_branch": False,
         "prs_known": False,
         "prs": [],
     }
