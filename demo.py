@@ -2,7 +2,7 @@
 
     uv run python demo.py
 
-Nothing here reads git or GitHub: the 49 rows are built in this file, so a
+Nothing here reads git or GitHub: the 61 rows are built in this file, so a
 screenshot shows the same repos on any machine and no private repo name reaches
 an image. Three module attributes in :mod:`cboard2.tui` would still reach the
 disk, and are replaced below for the run.
@@ -291,6 +291,124 @@ def _featured(now: float) -> list[Row]:
             branch="release/4.2",
             subject="Profile the signing hot path under load",
             behind=6,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "signing-audit",
+            now=now,
+            ago=20 * MINUTE,
+            branch="fix/signing-audit-log",
+            subject="Log every signing-key rotation to the audit trail",
+            unstaged=2,
+            ahead=1,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "edge-timeouts",
+            now=now,
+            ago=3 * HOUR,
+            branch="fix/edge-timeouts",
+            subject="Cut the edge read timeout to two seconds",
+            ahead=2,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "pr-4821",
+            now=now,
+            ago=8 * HOUR,
+            branch="review/pr-4821",
+            subject="Merge remote-tracking branch 'origin/main' into review",
+            behind=4,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "token-bucket-bench",
+            now=now,
+            ago=18 * HOUR,
+            branch="spike/token-bucket-bench",
+            subject="Benchmark the token bucket against the leaky bucket",
+            untracked=2,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "webhook-replay",
+            now=now,
+            ago=DAY,
+            branch="feat/webhook-replay",
+            subject="Replay a failed webhook from the delivery log",
+            staged=1,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "grpc-gateway",
+            now=now,
+            ago=3 * DAY,
+            branch="feat/grpc-gateway",
+            subject="Serve the v2 endpoints through the gRPC gateway",
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "audit-export",
+            now=now,
+            ago=4 * DAY,
+            branch="feat/audit-export",
+            subject="Export the audit trail as newline-delimited JSON",
+            ahead=3,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "bisect-latency",
+            now=now,
+            ago=6 * DAY,
+            branch=None,
+            detached=True,
+            subject="Bisecting the p99 latency regression",
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "renovate-fastapi",
+            now=now,
+            ago=9 * DAY,
+            branch="renovate/fastapi-0.115",
+            subject="Bump fastapi from 0.111 to 0.115",
+            behind=12,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "docs-runbook",
+            now=now,
+            ago=12 * DAY,
+            branch="docs/auth-runbook",
+            subject="Write the on-call runbook for a leaked signing key",
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "hsm-prototype",
+            now=now,
+            ago=20 * DAY,
+            branch="spike/hsm-signing",
+            subject="Sign with a key that never leaves the HSM",
+            untracked=5,
+            main_git_dir=DEMO_ROOT / "acme-api" / ".git",
+            remote=api,
+        ),
+        _row(
+            "release-4-1",
+            now=now,
+            ago=30 * DAY,
+            branch="release/4.1",
+            subject="Tag 4.1.3 and close the branch",
             main_git_dir=DEMO_ROOT / "acme-api" / ".git",
             remote=api,
         ),
@@ -735,7 +853,7 @@ def _rest(now: float) -> list[Row]:
 
 
 def demo_rows(now: float) -> list[Row]:
-    """Return all 49 invented repos, newest activity first."""
+    """Return all 61 invented repos, newest activity first."""
     rows = _featured(now) + _rest(now)
     return sorted(rows, key=lambda row: -row.active_at)
 
@@ -827,6 +945,7 @@ def _demo_config() -> Config:
         remote=False,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
 
 

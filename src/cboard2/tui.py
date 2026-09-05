@@ -12,7 +12,7 @@ of it.
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -36,7 +36,7 @@ from cboard2.pull import pull_default
 from cboard2.remote import ORIGIN
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Container, Iterable, Sequence
 
     from cboard2.board import Board, Row
     from cboard2.pull import Outcome
@@ -69,11 +69,85 @@ _WINDOWS: tuple[tuple[str, float | None], ...] = (
 )
 """Time windows cycled by ``t`` — label and lookback in seconds."""
 
+_WORKTREE_LIMIT = 5
+"""Worktree rows painted per repo before the rest fold into one row."""
+
+_FOLD_PREFIX = "fold:"
+"""Prefix marking a table row key as a fold row rather than a repo path."""
+
 _HEAD_SUBJECT_MAX = 40
 _DETAIL_FILE_LIMIT = 40
 _DETAIL_ENTRY_LIMIT = 15
 _ACTIVITY_LIMIT = 200
 _ACTIVITY_COLUMNS = ("When", "Repo", "Verb", "Detail")
+
+
+@dataclass(frozen=True, slots=True)
+class Fold:
+    """The fold row under a repo whose worktrees outnumber the cap."""
+
+    family: Path
+    total: int
+    hidden: int
+    """Worktrees left off the table, and zero while the family is expanded."""
+
+    @property
+    def key(self) -> str:
+        """The table row key, which no repo path collides with."""
+        return f"{_FOLD_PREFIX}{self.family}"
+
+
+def cap_worktrees(
+    rows: Sequence[Row],
+    *,
+    expanded: Container[Path] = frozenset[Path](),
+    limit: int = _WORKTREE_LIMIT,
+) -> list[Row | Fold]:
+    """Fold each repo's worktrees down to the ``limit`` most recently active.
+
+    A repo with thirty worktrees fills the screen on its own, so the rest go
+    behind one fold row carrying their count. A family in ``expanded`` keeps
+    every row and gets a fold row that collapses it again.
+    """
+    painted: list[Row | Fold] = []
+    for family, block in _families(rows):
+        worktrees = [row for row in block if row.state.main_git_dir is not None]
+        if len(worktrees) <= limit:
+            painted.extend(block)
+            continue
+        if family in expanded:
+            painted.extend(block)
+            painted.append(Fold(family=family, total=len(worktrees), hidden=0))
+            continue
+        kept = {id(row) for row in _most_recent(worktrees, limit)}
+        painted.extend(
+            row for row in block if row.state.main_git_dir is None or id(row) in kept
+        )
+        painted.append(
+            Fold(family=family, total=len(worktrees), hidden=len(worktrees) - limit),
+        )
+    return painted
+
+
+def _families(rows: Sequence[Row]) -> list[tuple[Path, list[Row]]]:
+    """Split the rows into the blocks :func:`group_families` left them in."""
+    blocks: list[tuple[Path, list[Row]]] = []
+    for row in rows:
+        family = row.state.family
+        if blocks and blocks[-1][0] == family:
+            blocks[-1][1].append(row)
+        else:
+            blocks.append((family, [row]))
+    return blocks
+
+
+def _most_recent(rows: Sequence[Row], limit: int) -> list[Row]:
+    """Return the ``limit`` rows whose activity is newest.
+
+    Chosen by activity rather than by position, so the cap keeps the same
+    worktrees under the name sort as under the recency sort.
+    """
+    return sorted(rows, key=lambda row: -row.active_at)[:limit]
 
 
 def filter_rows(
@@ -297,6 +371,26 @@ def row_cells(row: Row, now: float) -> tuple[Text, ...]:
         pr_text(row),
         active_text(row, now),
     )
+
+
+def fold_cells(fold: Fold) -> tuple[Text, ...]:
+    """Render a fold row: the hidden count, and the key that changes it."""
+    if fold.hidden:
+        plural = "" if fold.hidden == 1 else "s"
+        label = f"  ⑂ {fold.hidden} more worktree{plural}"
+        action = "enter to expand"
+    else:
+        label = f"  ⑂ {fold.total} worktrees"
+        action = "enter to collapse"
+    blanks = (Text("") for _ in range(len(_COLUMNS) - 2))
+    return (Text(label, style="dim"), Text(action, style="dim"), *blanks)
+
+
+def painted_row(entry: Row | Fold, now: float) -> tuple[str, tuple[Text, ...]]:
+    """Return the table key and cells for a repo row or a fold row."""
+    if isinstance(entry, Fold):
+        return entry.key, fold_cells(entry)
+    return str(entry.state.path), row_cells(entry, now)
 
 
 def cursor_key(table: DataTable[str | Text]) -> str | None:
@@ -593,6 +687,7 @@ class CboardApp(App[None]):
         self._screen_keys: tuple[str, ...] = ()
         self._reorder = True
         self._pulling: set[Path] = set()
+        self._expanded: set[Path] = set()
 
     def compose(self) -> ComposeResult:
         """Lay out the header, repo table and footer."""
@@ -669,10 +764,15 @@ class CboardApp(App[None]):
         except NoMatches:
             return  # screen torn down mid-poll; nothing to draw
 
-        visible = self.visible_rows()
+        visible = cap_worktrees(
+            self.visible_rows(),
+            expanded=self._expanded,
+            limit=self._board.config.worktree_limit,
+        )
         now = self._clock()
-        cells = [(str(row.state.path), row_cells(row, now)) for row in visible]
+        cells = [painted_row(entry, now) for entry in visible]
         keys = tuple(key for key, _ in cells)
+        folds = [entry for entry in visible if isinstance(entry, Fold)]
 
         if self._reorder or set(keys) != set(self._screen_keys):
             self.rebuild(table, cells)
@@ -682,7 +782,10 @@ class CboardApp(App[None]):
 
         self._painted = {key: tuple(cell.plain for cell in row) for key, row in cells}
         self._reorder = False
-        self.sub_title = self.status_text(len(visible))
+        self.sub_title = self.status_text(
+            len(visible) - len(folds),
+            sum(fold.hidden for fold in folds),
+        )
 
     def rebuild(
         self,
@@ -715,7 +818,7 @@ class CboardApp(App[None]):
                     continue
                 table.update_cell(key, columns[index], cell)
 
-    def status_text(self, visible: int) -> str:
+    def status_text(self, visible: int, folded: int = 0) -> str:
         """Describe what the table is showing, for the header's subtitle."""
         label, _ = _WINDOWS[self._window_index]
         parts = [f"{visible}/{len(self._rows)} repos", f"sort: {self._sort}"]
@@ -733,6 +836,8 @@ class CboardApp(App[None]):
             parts.append(f"{' + '.join(active)} only")
         if label != "all":
             parts.append(f"active <{label}")
+        if folded:
+            parts.append(f"{folded} worktrees folded")
         read_at = self._board.remote_read_at
         if read_at is not None:
             parts.append(f"remote read {relative(self._clock() - read_at)}")
@@ -847,7 +952,7 @@ class CboardApp(App[None]):
         except NoMatches:
             return
         key = cursor_key(table)
-        if key is None:
+        if key is None or key.startswith(_FOLD_PREFIX):
             return
 
         selected = Path(key)
@@ -867,13 +972,25 @@ class CboardApp(App[None]):
         """Open the cross-repo activity feed."""
         self.push_screen(ActivityScreen(self._board, clock=self._clock))
 
+    def toggle_fold(self, family: Path) -> None:
+        """Paint every worktree of ``family``, or fold it back to the cap."""
+        if family in self._expanded:
+            self._expanded.discard(family)
+        else:
+            self._expanded.add(family)
+        self._reorder = True
+        self.render_rows()
+
     def on_data_table_row_selected(
         self,
         event: DataTable.RowSelected,
     ) -> None:
-        """Open the detail modal for the selected repo."""
+        """Open the detail modal, or fold the repo when the row is a fold row."""
         key = event.row_key.value
         if key is None:
+            return
+        if key.startswith(_FOLD_PREFIX):
+            self.toggle_fold(Path(key.removeprefix(_FOLD_PREFIX)))
             return
         for row in self._rows:
             if str(row.state.path) == key:

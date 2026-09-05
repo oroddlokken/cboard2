@@ -45,6 +45,7 @@ def _board(root: Path, *, remote: bool = False) -> Board:
         remote=remote,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
     return Board(config)
 
@@ -77,6 +78,7 @@ def _remote_board(
         remote=True,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
     reader = RemoteReader(
         300.0,

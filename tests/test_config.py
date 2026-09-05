@@ -10,6 +10,7 @@ from cboard2.config import (
     DEFAULT_DORMANT_INTERVAL,
     DEFAULT_MAX_DEPTH,
     DEFAULT_REMOTE,
+    DEFAULT_WORKTREE_LIMIT,
     ConfigError,
     load_config,
 )
@@ -35,6 +36,8 @@ def test_missing_file_yields_defaults(tmp_path: Path) -> None:
     assert config.remote is True
     assert config.remote_interval == DEFAULT_REMOTE_INTERVAL
     assert config.remote_interval == 300.0
+    assert config.worktree_limit == DEFAULT_WORKTREE_LIMIT
+    assert config.worktree_limit == 5
 
 
 def test_reads_the_remote_keys(tmp_path: Path) -> None:
@@ -75,6 +78,12 @@ def test_reads_every_key(tmp_path: Path) -> None:
     assert config.dormant_interval == 1800.0
 
 
+def test_reads_the_worktree_limit(tmp_path: Path) -> None:
+    config = load_config(_write(tmp_path, "worktree_limit = 12\n"))
+
+    assert config.worktree_limit == 12
+
+
 def test_bare_number_interval_is_seconds(tmp_path: Path) -> None:
     config = load_config(_write(tmp_path, "dormant_interval = 90\n"))
 
@@ -89,6 +98,8 @@ def test_bare_number_interval_is_seconds(tmp_path: Path) -> None:
         ('roots = "~/git"\n', "roots"),
         ("dormant = [1, 2]\n", "dormant"),
         ("max_depth = -1\n", "max_depth"),
+        ("worktree_limit = -2\n", "worktree_limit"),
+        ('worktree_limit = "five"\n', "worktree_limit"),
         ('max_depth = "deep"\n', "max_depth"),
     ],
 )

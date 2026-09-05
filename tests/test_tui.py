@@ -23,9 +23,12 @@ from cboard2.tui import (
     ActivityScreen,
     CboardApp,
     DetailScreen,
+    Fold,
     active_text,
+    cap_worktrees,
     cursor_key,
     filter_rows,
+    fold_cells,
     pr_content,
     pr_text,
     relative,
@@ -51,6 +54,7 @@ def _config(root: Path, *, dormant: tuple[Path, ...] = ()) -> Config:
         remote=False,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
 
 
@@ -1264,3 +1268,131 @@ def test_grouping_leaves_a_worktree_whose_repo_is_filtered_out() -> None:
     rows = [_row("side", main_git_dir=Path("/tmp/mid/.git"))]  # noqa: S108 — rendered
 
     assert group_families(rows) == rows
+
+
+_HUB = Path("/tmp/hub")  # noqa: S108 — never touched, only rendered
+_HUB_GIT = _HUB / ".git"
+
+
+def _family(count: int, *, newest: float = 1000.0) -> list[Row]:
+    """Return the hub repo and ``count`` worktrees under it, newest first."""
+    return [
+        _row("hub", active_at=newest + 1),
+        *(
+            _row(f"tree{index:02d}", active_at=newest - index, main_git_dir=_HUB_GIT)
+            for index in range(count)
+        ),
+    ]
+
+
+def _names(painted: list[Row | Fold]) -> list[str]:
+    """Return the repo names painted, leaving the fold rows out."""
+    return [entry.state.name for entry in painted if isinstance(entry, Row)]
+
+
+def test_worktrees_over_the_limit_fold_into_one_row() -> None:
+    painted = cap_worktrees(_family(15), limit=5)
+    folds = [entry for entry in painted if isinstance(entry, Fold)]
+
+    assert _names(painted) == ["hub", "tree00", "tree01", "tree02", "tree03", "tree04"]
+    assert [(fold.family, fold.total, fold.hidden) for fold in folds] == [
+        (_HUB_GIT, 15, 10),
+    ]
+    assert painted[-1] is folds[0]
+
+
+def test_a_repo_at_the_limit_gets_no_fold_row() -> None:
+    painted = cap_worktrees(_family(5), limit=5)
+
+    assert not [entry for entry in painted if isinstance(entry, Fold)]
+    assert len(_names(painted)) == 6
+
+
+def test_the_fold_keeps_the_worktrees_with_the_newest_activity() -> None:
+    rows = _family(4)
+    rows.append(_row("stale", active_at=1.0, main_git_dir=_HUB_GIT))
+    rows.append(_row("fresh", active_at=5000.0, main_git_dir=_HUB_GIT))
+
+    painted = cap_worktrees(sort_rows(rows, "name"), limit=2)
+
+    assert _names(painted) == ["hub", "fresh", "tree00"]
+
+
+def test_an_expanded_family_paints_every_worktree() -> None:
+    painted = cap_worktrees(_family(15), expanded={_HUB_GIT}, limit=5)
+    folds = [entry for entry in painted if isinstance(entry, Fold)]
+
+    assert len(_names(painted)) == 16
+    assert [fold.hidden for fold in folds] == [0]
+
+
+def test_the_fold_row_names_the_key_that_changes_it() -> None:
+    collapsed = fold_cells(Fold(family=_HUB_GIT, total=15, hidden=10))
+    expanded = fold_cells(Fold(family=_HUB_GIT, total=15, hidden=0))
+
+    assert len(collapsed) == len(_COLUMNS)
+    assert collapsed[0].plain == "  ⑂ 10 more worktrees"
+    assert collapsed[1].plain == "enter to expand"
+    assert expanded[0].plain == "  ⑂ 15 worktrees"
+    assert expanded[1].plain == "enter to collapse"
+
+
+@pytest.mark.asyncio
+async def test_enter_on_the_fold_row_expands_then_collapses(tmp_path: Path) -> None:
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(_family(8))
+        await pilot.pause()
+        folded = _keys(app)
+
+        _table(app).move_cursor(row=len(folded) - 1)
+        await pilot.press("enter")
+        await pilot.pause()
+        expanded = _keys(app)
+        subtitle_expanded = app.sub_title
+
+        await pilot.press("enter")
+        await pilot.pause()
+        collapsed = _keys(app)
+        subtitle_folded = app.sub_title
+
+    fold_key = f"fold:{_HUB_GIT}"
+    assert folded == [
+        str(_HUB),
+        *(str(Path("/tmp") / f"tree{index:02d}") for index in range(5)),  # noqa: S108
+        fold_key,
+    ]
+    assert len(expanded) == 10
+    assert expanded[-1] == fold_key
+    assert collapsed == folded
+    assert "3 worktrees folded" in subtitle_folded
+    assert "folded" not in subtitle_expanded
+
+
+@pytest.mark.asyncio
+async def test_shift_d_on_the_fold_row_writes_nothing(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    app = CboardApp(
+        _board(tmp_path),
+        refresh_interval=NEVER,
+        clock=lambda: 1_800_000_000.0,
+        config_file=config_file,
+    )
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(_family(8))
+        await pilot.pause()
+        _table(app).move_cursor(row=len(_keys(app)) - 1)
+
+        await pilot.press("D")
+        await pilot.pause()
+
+    assert not config_file.exists()
+    assert app._board.config.dormant == ()  # noqa: SLF001

@@ -31,6 +31,7 @@ def _config(
         remote=False,
         remote_interval=300.0,
         worktrees=worktrees,
+        worktree_limit=5,
     )
 
 
@@ -123,6 +124,7 @@ def test_overlapping_roots_return_each_repo_once(
         remote=False,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
 
     assert [found.path for found in discover(config)] == [repo]

@@ -38,7 +38,7 @@ work still sorts you to the top.
 
 | Key | Does |
 |-----|------|
-| `enter` | Detail for the selected repo: remote state, your open PRs, changed files, branches, recent HEAD movements |
+| `enter` | On a fold row, show or hide that repo's remaining worktrees. Otherwise detail for the selected repo: remote state, your open PRs, changed files, branches, recent HEAD movements |
 | `a` | Activity feed across all repos, read from their reflogs |
 | `d` `u` `b` `p` | Filter to dirty / unpushed / behind / has-open-PR |
 | `s` | Sort by recent, name, or dirty |
@@ -83,6 +83,7 @@ dormant = ["~/git/old-thing"]
 | `remote` | `true` | Whether to ask any origin anything at all |
 | `remote_interval` | `5m` | How often to ask |
 | `worktrees` | `true` | Whether a repo's linked worktrees get rows of their own |
+| `worktree_limit` | `5` | Worktree rows painted per repo before the rest fold behind one row |
 
 A dormant repo is still discovered, listed and readable. It is polled
 rarely, so a shelf of archived clones costs nothing per second. `CBOARD2_CONFIG`
@@ -93,7 +94,9 @@ one kept inside its repo where the walk would never reach it. Every sort order
 paints a repo and its worktrees as one block, placed where the most interesting
 member of the group falls. The origin URL, the open PRs and the default branch
 are read once for a repo and shown on every one of its worktrees, since they
-share `refs`.
+share `refs`. A repo past `worktree_limit` paints its most recently active
+worktrees and folds the rest behind a `  ⑂ 10 more worktrees` row; `enter` on
+that row shows them all, and `enter` again folds them back.
 
 ## Where the numbers come from
 

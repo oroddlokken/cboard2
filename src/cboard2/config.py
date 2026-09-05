@@ -52,6 +52,13 @@ A worktree has its own HEAD and its own dirty tree, so it is work the dashboard
 would otherwise hide. Set ``worktrees = false`` to see one row per clone.
 """
 
+DEFAULT_WORKTREE_LIMIT = 5
+"""Worktree rows the dashboard paints per repo before folding the rest away.
+
+A repo with thirty worktrees fills the screen on its own, so the rest sit
+behind one row that enter expands. 0 folds every worktree away.
+"""
+
 
 class ConfigError(Exception):
     """A config file was found, but one of its keys cannot be used."""
@@ -68,6 +75,7 @@ class Config:
     remote: bool
     remote_interval: float
     worktrees: bool
+    worktree_limit: int
 
 
 def config_path() -> Path:
@@ -93,6 +101,7 @@ def default_config() -> Config:
         remote=DEFAULT_REMOTE,
         remote_interval=DEFAULT_REMOTE_INTERVAL,
         worktrees=DEFAULT_WORKTREES,
+        worktree_limit=DEFAULT_WORKTREE_LIMIT,
     )
 
 
@@ -118,6 +127,7 @@ def load_config(path: Path | None = None) -> Config:
         remote=_flag(data, "remote", fallback=DEFAULT_REMOTE),
         remote_interval=_interval(data, "remote_interval", DEFAULT_REMOTE_INTERVAL),
         worktrees=_flag(data, "worktrees", fallback=DEFAULT_WORKTREES),
+        worktree_limit=_worktree_limit(data),
     )
 
 
@@ -142,6 +152,15 @@ def _depth(data: dict[str, object]) -> int:
     value = data.get("max_depth", DEFAULT_MAX_DEPTH)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         msg = "max_depth must be a non-negative integer"
+        raise ConfigError(msg)
+    return value
+
+
+def _worktree_limit(data: dict[str, object]) -> int:
+    """Read ``worktree_limit``, rejecting a non-integer or negative value."""
+    value = data.get("worktree_limit", DEFAULT_WORKTREE_LIMIT)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = "worktree_limit must be a non-negative integer"
         raise ConfigError(msg)
     return value
 

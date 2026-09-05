@@ -27,6 +27,7 @@ def _board(root: Path) -> Board:
         remote=False,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
     return Board(config)
 
@@ -113,6 +114,7 @@ def test_read_remote_walks_the_roots_before_its_first_read(tmp_path: Path) -> No
         remote=True,
         remote_interval=300.0,
         worktrees=True,
+        worktree_limit=5,
     )
     gh = _CountingGh()
     board = Board(config, remote=RemoteReader(gh=gh))
