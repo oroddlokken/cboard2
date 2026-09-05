@@ -62,16 +62,32 @@ _GIT_ENV = {
 
 def git(cwd: Path, *args: str) -> str:
     """Run git in ``cwd`` and return stdout, raising on a non-zero exit."""
-    result = subprocess.run(  # noqa: S603
+    return _git(cwd, args, check=True).stdout
+
+
+def git_may_fail(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in ``cwd`` and return the result, non-zero exit included.
+
+    For commands whose failure is the point, such as a merge that conflicts.
+    """
+    return _git(cwd, args, check=False)
+
+
+def _git(
+    cwd: Path,
+    args: Sequence[str],
+    *,
+    check: bool,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
         ["git", *args],  # noqa: S607
         cwd=cwd,
         env={**os.environ, **_GIT_ENV},
         capture_output=True,
         text=True,
-        check=True,
+        check=check,
         timeout=30,
     )
-    return result.stdout
 
 
 @pytest.fixture

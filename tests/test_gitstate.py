@@ -6,7 +6,7 @@ import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
-from conftest import RecordingRunner, git
+from conftest import RecordingRunner, git, git_may_fail
 
 from cboard2 import gitstate
 from cboard2.discovery import Repo
@@ -238,13 +238,7 @@ def test_a_conflict_counts_apart_from_the_ordinary_edits(git_repo: Path) -> None
     git(git_repo, "checkout", "-q", "main")
     (git_repo / "tracked.txt").write_text("ours\n", encoding="utf-8")
     git(git_repo, "commit", "-qam", "Ours")
-    subprocess.run(
-        ["git", "merge", "theirs"],  # noqa: S607
-        cwd=git_repo,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
+    git_may_fail(git_repo, "merge", "theirs")
 
     state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
 
