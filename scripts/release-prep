@@ -240,6 +240,21 @@ echo ""
 info "Watch mode — monitoring CI and release actions…"
 
 info "Waiting for PR checks…"
+# gh exits non-zero for an empty rollup and for a failed check alike, and a
+# pull request seconds old always reports none. Wait for the first check to
+# register before handing off to --watch.
+CHECKS=0
+for _ in $(seq 1 30); do
+    CHECKS=$(gh pr view "${BRANCH}" --json statusCheckRollup \
+        -q '[.statusCheckRollup[]?] | length' 2>/dev/null || echo 0)
+    [[ -n "$CHECKS" ]] || CHECKS=0
+    [[ "$CHECKS" -gt 0 ]] && break
+    sleep 5
+done
+if [[ "$CHECKS" -eq 0 ]]; then
+    die "No check registered on ${BRANCH} within 150s. Read the PR's checks, or rerun with -W."
+fi
+
 if ! gh pr checks "${BRANCH}" --watch --fail-fast; then
     die "PR checks failed"
 fi

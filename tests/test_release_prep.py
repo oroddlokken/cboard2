@@ -44,6 +44,42 @@ def _make_gh_stub(bin_dir: Path) -> None:
     stub.chmod(0o755)
 
 
+def _make_watch_gh_stub(bin_dir: Path, counter: Path) -> None:
+    """Put a ``gh`` on PATH whose check rollup fills only on the second poll.
+
+    The counter file carries across invocations, which is how one stub reports
+    an empty rollup once and a registered check after that.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "gh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'args="$*"\n'
+        'case "$args" in\n'
+        '    *"--json state,reviewDecision"*) exit 1 ;;\n'
+        '    *"--json statusCheckRollup"*)\n'
+        f"        n=$(cat {counter} 2>/dev/null || echo 0)\n"
+        f'        n=$((n + 1)); echo "$n" > {counter}\n'
+        '        if [[ "$n" -ge 2 ]]; then echo 1; else echo 0; fi ;;\n'
+        '    *"--json state"*) echo MERGED ;;\n'
+        '    "pr checks"*)\n'
+        f"        n=$(cat {counter} 2>/dev/null || echo 0)\n"
+        '        if [[ "$n" -ge 2 ]]; then exit 0; fi\n'
+        '        echo "no checks reported on the branch" >&2; exit 1 ;;\n'
+        '    "pr create"*) echo "https://example.invalid/pr/1" ;;\n'
+        '    "run list"*) echo 12345 ;;\n'
+        '    "run watch"*) exit 0 ;;\n'
+        "    *) exit 1 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    # The poll sleeps 5s between tries; the script resolves sleep through PATH.
+    naptime = bin_dir / "sleep"
+    naptime.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    naptime.chmod(0o755)
+
+
 def _run_script(
     repo: Path,
     bin_dir: Path,
@@ -200,3 +236,28 @@ class TestDirtyTree:
         assert result.returncode != 0
         assert "dirty" in result.stderr
         assert git(repo, "branch", "-l", "release/v9.9.6").strip() == ""
+
+
+class TestWatchPhase:
+    """The wait for PR checks, which runs when -W is not passed."""
+
+    def test_waits_for_the_first_check_to_register(
+        self,
+        tmp_path: Path,
+        remote_and_clone: tuple[Path, Path],
+    ) -> None:
+        """An empty rollup means the check has not registered, not that it failed.
+
+        gh exits non-zero for both, which ended the first real release run
+        after every push had already landed.
+        """
+        _remote, repo = remote_and_clone
+        counter = tmp_path / "rollup-calls"
+        bin_dir = tmp_path / "watchbin"
+        _make_watch_gh_stub(bin_dir, counter)
+
+        result = _run_script(repo, bin_dir, ["--skip-checks", "9.9.5"])
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert counter.read_text(encoding="utf-8").strip() == "2"
+        assert "All checks passed" in result.stdout

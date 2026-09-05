@@ -15,3 +15,7 @@
 
 - **A repo's name takes a color derived from its origin's host and owner**, so every clone under one owner matches at a glance. `origin_colors = false` turns it off.
 - **A non-GitHub origin's default branch comes from `git ls-remote --symref origin HEAD`**, with the checked-out branch named as an extra ref, so a GitLab or self-hosted remote reports both branches' behind-ness. Those repos show no PRs, which needs `gh`.
+
+### Development
+
+- **`just release-prep` waits for the first PR check to register instead of dying on an empty rollup.** `gh pr checks --watch` ran seconds after `gh pr create`, and gh exits non-zero for an empty rollup exactly as for a failed check. The first real release run stopped there, after the branch, the RC tag and the PR had already landed. The poll counts the rollup with `gh pr view --json statusCheckRollup`, which the status summary already calls, and gives up after 150 seconds.
