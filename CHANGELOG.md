@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.2 (2026-09-05)
+
 ### Development
 
 - **A release stops before its tag when `HOMEBREW_TAP_TOKEN` cannot push to the tap.** v0.1.1's `update-homebrew` job made its formula commit and then took a 403 on the push, after the tag and the release were already public. The publish job now probes `info/refs?service=git-receive-pack` with the token, the endpoint git itself hits, and fails there naming the token and the fix. Reading `permissions.push` from the repository API would have passed: it reports the authenticated user's role, which is push for the owner however narrow the token.
