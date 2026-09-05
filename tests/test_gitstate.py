@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from typing import TYPE_CHECKING
 
+import pytest
 from conftest import RecordingRunner, git
 
 from cboard2 import gitstate
@@ -14,8 +15,6 @@ from cboard2.gitstate import Poller, parse_porcelain_v2
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
-
-    import pytest
 
 INTERVAL = 4 * 3600.0
 
@@ -197,7 +196,8 @@ def test_parses_branch_upstream_and_counts() -> None:
     assert snap.upstream == "origin/main"
     assert (snap.ahead, snap.behind) == (2, 1)
     assert snap.staged == 2
-    assert snap.unstaged == 2
+    assert snap.unstaged == 1
+    assert snap.unmerged == 1
     assert snap.untracked == 1
 
 
@@ -229,3 +229,104 @@ def test_a_clone_labels_itself(git_repo: Path) -> None:
 
     assert state.label == git_repo.name
     assert state.row_label == git_repo.name
+
+
+def test_a_conflict_counts_apart_from_the_ordinary_edits(git_repo: Path) -> None:
+    git(git_repo, "checkout", "-qb", "theirs")
+    (git_repo / "tracked.txt").write_text("theirs\n", encoding="utf-8")
+    git(git_repo, "commit", "-qam", "Theirs")
+    git(git_repo, "checkout", "-q", "main")
+    (git_repo / "tracked.txt").write_text("ours\n", encoding="utf-8")
+    git(git_repo, "commit", "-qam", "Ours")
+    subprocess.run(
+        ["git", "merge", "theirs"],  # noqa: S607
+        cwd=git_repo,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
+
+    assert state.unmerged == 1
+    assert state.unstaged == 0
+    assert state.operation == "merge"
+    assert state.halted
+    assert gitstate.state_parts(state)[:2] == ["merge", "U1"]
+
+
+def test_parses_an_unmerged_status_line_into_its_own_count() -> None:
+    snap = parse_porcelain_v2(
+        "u UU N... 100644 100644 100644 100644 ggg hhh iii conflict.txt\n",
+    )
+
+    assert snap.unmerged == 1
+    assert snap.unstaged == 0
+    assert snap.dirty_paths == ("conflict.txt",)
+
+
+@pytest.mark.parametrize(
+    ("marker", "operation"),
+    [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("BISECT_LOG", "bisect"),
+    ],
+)
+def test_each_in_progress_marker_names_its_operation(
+    git_repo: Path,
+    marker: str,
+    operation: str,
+) -> None:
+    target = git_repo / ".git" / marker
+    if marker.startswith("rebase-"):
+        target.mkdir()
+    else:
+        target.write_text("1111111111111111111111111111111111111111\n")
+
+    state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
+
+    assert state.operation == operation
+    assert gitstate.state_parts(state)[0] == operation
+
+
+def test_a_rebase_outranks_the_merge_head_it_leaves_behind(git_repo: Path) -> None:
+    (git_repo / ".git" / "rebase-merge").mkdir()
+    (git_repo / ".git" / "MERGE_HEAD").write_text(
+        "1111111111111111111111111111111111111111\n"
+    )
+
+    assert gitstate.read_operation(git_repo / ".git") == "rebase"
+
+
+def test_a_stash_is_counted_and_shown(git_repo: Path) -> None:
+    (git_repo / "tracked.txt").write_text("shelved\n", encoding="utf-8")
+    git(git_repo, "stash", "push", "-q", "-m", "first")
+    (git_repo / "tracked.txt").write_text("shelved again\n", encoding="utf-8")
+    git(git_repo, "stash", "push", "-q", "-m", "second")
+
+    state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
+
+    assert state.stashed == 2
+    assert state.dirty == 0
+    assert gitstate.state_parts(state) == ["stash 2"]
+
+
+def test_a_repo_with_no_stash_counts_none(git_repo: Path) -> None:
+    state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
+
+    assert state.stashed == 0
+    assert state.operation == gitstate.NO_OPERATION
+    assert gitstate.state_parts(state) == []
+
+
+def test_a_worktree_reports_the_repos_stash(git_repo: Path, worktree: Path) -> None:
+    (git_repo / "tracked.txt").write_text("shelved\n", encoding="utf-8")
+    git(git_repo, "stash", "push", "-q", "-m", "shared")
+
+    state = Poller(INTERVAL).poll([_worktree(worktree, git_repo)])[0]
+
+    assert state.stashed == 1

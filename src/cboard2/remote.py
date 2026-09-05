@@ -1,18 +1,22 @@
-"""A moved default branch, the checked-out branch and the user's own open pull requests.
+"""A moved default branch, the checked-out branch, and the pull requests in play.
 
-All three are read from the origin. ``git status --porcelain=v2 --branch``
+All of it is read from the origin. ``git status --porcelain=v2 --branch``
 reports ``behind`` against the local remote-tracking ref, so it stays at zero
 until something fetches. This module asks the origin directly instead, and
 never fetches: a poll that rewrote ``refs/remotes/origin/*`` under the user
 would change what their next ``git log`` shows.
 
-Two network calls cover every repo. One batched GraphQL query returns each
-repo's default branch and its tip, plus the tip of whatever branch is checked
-out in each of its worktrees; one ``gh search prs`` returns every open PR the
-user authored, anywhere. Measured on the author's machine: 66 repos in one
-query took 4.4s, against 1.7s per repo for ``git ls-remote`` — which is why the
-query is batched and why the read runs on its own slow interval rather than the
-2s poll tick.
+Three network calls cover every repo. Two ``gh search prs`` calls return every
+open PR the user authored and every one waiting on their review, anywhere; one
+batched GraphQL query then returns each repo's default branch and its tip, the
+tip of whatever branch is checked out in each of its worktrees, and the checks
+rollup of every PR the searches found on a watched repo. Measured on the
+author's machine: 66 repos in one query took 4.4s, against 1.7s per repo for
+``git ls-remote`` — which is why the query is batched and why the read runs on
+its own slow interval rather than the 2s poll tick.
+
+The searches run before the query because the query needs their PR numbers.
+They were already sequential, so ordering them costs nothing.
 
 A branch name reaches that query as a GraphQL variable, never as text spliced
 into it. Git allows a double quote in a branch name, and the query is a string.
@@ -63,6 +67,12 @@ if TYPE_CHECKING:
     type GhRunner = Callable[[Sequence[str]], str | None]
     type CacheLoader = Callable[[], Cached | None]
     type CacheSaver = Callable[[Cached], bool]
+    type _Chunk = tuple[
+        dict[str, tuple[str, str]],
+        dict[str, dict[str, str]],
+        dict[str, dict[int, str]],
+    ]
+    """One chunk's answers: its defaults, its branch tips and its checks states."""
 
 GH_TIMEOUT = 30.0
 """Seconds before a gh call is abandoned and its repos left unknown."""
@@ -105,16 +115,64 @@ _HEADS_ARGS = (
     ),
 )
 
+_PR_SEARCH_FIELDS = "number,title,isDraft,repository,url,updatedAt"
+
 _PR_SEARCH_ARGS = (
     "search",
     "prs",
     "--author=@me",
     "--state=open",
     "--json",
-    "number,title,isDraft,repository,url,updatedAt",
+    _PR_SEARCH_FIELDS,
     "--limit",
     str(PR_SEARCH_LIMIT),
 )
+
+_REVIEW_SEARCH_ARGS = (
+    "search",
+    "prs",
+    "--review-requested=@me",
+    "--state=open",
+    "--json",
+    _PR_SEARCH_FIELDS,
+    "--limit",
+    str(PR_SEARCH_LIMIT),
+)
+"""The second search: PRs someone has asked the user to review."""
+
+CHECKS_UNKNOWN = "unknown"
+CHECKS_NONE = "none"
+CHECKS_PASSING = "passing"
+CHECKS_FAILING = "failing"
+CHECKS_PENDING = "pending"
+
+_ROLLUP_STATES = MappingProxyType(
+    {
+        "SUCCESS": CHECKS_PASSING,
+        "FAILURE": CHECKS_FAILING,
+        "ERROR": CHECKS_FAILING,
+        "PENDING": CHECKS_PENDING,
+        "EXPECTED": CHECKS_PENDING,
+    },
+)
+"""GitHub's ``statusCheckRollup`` states, mapped to the four this module reports.
+
+A PR whose head commit has no rollup reads :data:`CHECKS_NONE` — no checks are
+configured — which is a different answer from :data:`CHECKS_UNKNOWN`, where the
+query never reached it.
+"""
+
+_CHECKS_ORDER = (CHECKS_FAILING, CHECKS_PENDING, CHECKS_PASSING, CHECKS_NONE)
+"""Rollup states from the one worth acting on first to the one worth ignoring."""
+
+_CHECKS_MARKS = MappingProxyType(
+    {
+        CHECKS_PASSING: "✓",
+        CHECKS_FAILING: "✗",
+        CHECKS_PENDING: "•",
+    },
+)
+"""The glyph each state shows in a table cell. The other two show nothing."""
 
 _SLUG_PATTERN = re.compile(
     r"github\.com[:/]+(?P<owner>[A-Za-z0-9._-]+)/(?P<name>[A-Za-z0-9._-]+?)"
@@ -141,13 +199,34 @@ LOCAL_ORIGIN = "local"
 
 @dataclass(frozen=True, slots=True)
 class PullRequest:
-    """One open pull request the user authored."""
+    """One open pull request the user authored or was asked to review."""
 
     number: int
     title: str
     url: str
     draft: bool
     updated_at: float | None
+    checks: str = CHECKS_UNKNOWN
+    """The head commit's checks rollup, from the five ``CHECKS_*`` values.
+
+    Filled by the GraphQL query, not by the search that found the PR, so a
+    failed query leaves it :data:`CHECKS_UNKNOWN` with the PR still listed.
+    """
+
+
+def worst_checks(prs: Sequence[PullRequest]) -> str:
+    """Return the state of the PR most worth looking at among ``prs``.
+
+    A failing PR outranks a pending one and a pending one a passing one, so one
+    cell can stand for a repo holding several.
+    """
+    states = {pr.checks for pr in prs}
+    return next((state for state in _CHECKS_ORDER if state in states), CHECKS_UNKNOWN)
+
+
+def checks_mark(state: str) -> str:
+    """Return the glyph for a checks state, or "" where there is nothing to say."""
+    return _CHECKS_MARKS.get(state, "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +247,13 @@ class RemoteState:
     default_known: bool = False
     prs: tuple[PullRequest, ...] = ()
     prs_known: bool = False
+    review_prs: tuple[PullRequest, ...] = ()
+    """Open PRs on this repo that have asked the user for a review."""
+
+    review_prs_known: bool = False
+    """Whether the review search succeeded. Separate from ``prs_known``: the two
+    searches fail separately, and an empty result is a real answer for either."""
+
     behind_default: bool = False
     """Whether the remote tip is missing from the local default branch.
 
@@ -216,6 +302,9 @@ _NO_BRANCHES: Mapping[str, Mapping[str, str]] = MappingProxyType({})
 _NO_PRS: Mapping[str, tuple[PullRequest, ...]] = MappingProxyType({})
 """Empty defaults for :class:`Cached`, immutable so the dataclass accepts them."""
 
+_NO_CHECKS: Mapping[str, Sequence[int]] = MappingProxyType({})
+"""No pull requests to ask about, for a read whose searches both failed."""
+
 
 @dataclass(frozen=True, slots=True)
 class Cached:
@@ -245,6 +334,10 @@ class Cached:
     False and an empty ``prs`` are different answers: the first is a failed
     search, the second a user with no open PRs anywhere.
     """
+
+    review_prs: Mapping[str, tuple[PullRequest, ...]] = _NO_PRS
+    review_prs_known: bool = False
+    """The same pair for the PRs waiting on the user's review."""
 
 
 def run_gh(args: Sequence[str]) -> str | None:
@@ -443,25 +536,41 @@ def target_branch(branch: str | None, upstream: tuple[str, str] | None) -> str |
     return ref.removeprefix("refs/heads/") or None
 
 
-def build_query(slugs: Sequence[str], pairs: Sequence[tuple[str, str]] = ()) -> str:
-    """Return a GraphQL query for each slug's default branch and named branches.
+def build_query(
+    slugs: Sequence[str],
+    pairs: Sequence[tuple[str, str]] = (),
+    checks: Sequence[tuple[str, int]] = (),
+) -> str:
+    """Return a GraphQL query for each slug's branches and pull request checks.
 
     ``pairs`` are the ``(slug, branch)`` lookups to add, each nested under its
     slug as a ``b<index>`` alias reading the variable of the same name.
-    :func:`parse_defaults` and :func:`parse_branch_tips` read both indexes back
-    out, and the slug's own index is its alias because a slug is not a legal
-    GraphQL name.
+    ``checks`` are the ``(slug, number)`` pull requests whose head commit's
+    rollup to ask for, as a ``c<index>`` alias. :func:`parse_defaults`,
+    :func:`parse_branch_tips` and :func:`parse_check_states` read the indexes
+    back out, and the slug's own index is its alias because a slug is not a
+    legal GraphQL name.
+
+    A PR number is written into the query text rather than bound, because it
+    reaches here as an ``int`` off a JSON parse. A branch name is a string the
+    user chose and stays a variable.
     """
-    refs: dict[str, list[str]] = {}
+    nested: dict[str, list[str]] = {}
     for index, (slug, _) in enumerate(pairs):
-        refs.setdefault(slug, []).append(
+        nested.setdefault(slug, []).append(
             f"b{index}: ref(qualifiedName: $b{index}) {{ target {{ oid }} }}",
+        )
+    for index, (slug, number) in enumerate(checks):
+        nested.setdefault(slug, []).append(
+            f"c{index}: pullRequest(number: {int(number)}) "
+            "{ commits(last: 1) { nodes { commit "
+            "{ statusCheckRollup { state } } } } }",
         )
     lines = [
         f'  r{index}: repository(owner: "{slug.split("/")[0]}", '
         f'name: "{slug.split("/")[1]}") '
         "{ defaultBranchRef { name target { oid } }"
-        + "".join(f" {lookup}" for lookup in refs.get(slug, ()))
+        + "".join(f" {lookup}" for lookup in nested.get(slug, ()))
         + " }"
         for index, slug in enumerate(slugs)
     ]
@@ -528,6 +637,85 @@ def parse_branch_tips(
         if isinstance(oid, str):
             found.setdefault(slug, {})[branch] = oid
     return found
+
+
+def parse_check_states(
+    text: str,
+    slugs: Sequence[str],
+    checks: Sequence[tuple[str, int]],
+) -> dict[str, dict[int, str]]:
+    """Map each asked-about PR to its head commit's checks state, by slug and number.
+
+    A PR whose repository entry is missing is left out and stays
+    :data:`CHECKS_UNKNOWN`; one whose head commit carries no rollup reads
+    :data:`CHECKS_NONE`, which is the answer that no checks run here.
+    """
+    payload = _as_dict(_load(text))
+    data = _as_dict(payload.get("data"))
+    if not data:
+        return {}
+
+    aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
+    found: dict[str, dict[int, str]] = {}
+    for index, (slug, number) in enumerate(checks):
+        repo = _as_dict(data.get(aliases.get(slug, "")))
+        if f"c{index}" not in repo:
+            continue
+        entry = _as_dict(repo.get(f"c{index}"))
+        if not entry:
+            continue
+        found.setdefault(slug, {})[number] = _rollup_state(entry)
+    return found
+
+
+def _rollup_state(pull_request: dict[str, object]) -> str:
+    """Read one ``pullRequest`` entry's checks rollup into a ``CHECKS_*`` value."""
+    nodes = _as_dict(pull_request.get("commits")).get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return CHECKS_NONE
+    commit = _as_dict(_as_dict(cast("list[object]", nodes)[0]).get("commit"))
+    rollup = commit.get("statusCheckRollup")
+    if not isinstance(rollup, dict):
+        return CHECKS_NONE
+    state = cast("dict[str, object]", rollup).get("state")
+    if not isinstance(state, str):
+        return CHECKS_NONE
+    return _ROLLUP_STATES.get(state, CHECKS_PENDING)
+
+
+def with_checks(
+    prs: Mapping[str, tuple[PullRequest, ...]],
+    states: Mapping[str, Mapping[int, str]],
+) -> dict[str, tuple[PullRequest, ...]]:
+    """Return ``prs`` with each entry's checks state filled in where one is known."""
+    return {
+        slug: tuple(
+            replace(pr, checks=states[slug][pr.number])
+            if pr.number in states.get(slug, {})
+            else pr
+            for pr in found
+        )
+        for slug, found in prs.items()
+    }
+
+
+def check_lookups(
+    slugs: Sequence[str],
+    *searches: Mapping[str, tuple[PullRequest, ...]] | None,
+) -> dict[str, list[int]]:
+    """Return the PR numbers to ask about, per watched slug.
+
+    Only the repos on the watch list: the searches cover every repo the user
+    touches anywhere, and a rollup for a PR that gets no row is a field nobody
+    reads. One PR found by both searches is asked about once.
+    """
+    watched = set(slugs)
+    found: dict[str, set[int]] = {}
+    for search in searches:
+        for slug, prs in (search or {}).items():
+            if slug in watched:
+                found.setdefault(slug, set()).update(pr.number for pr in prs)
+    return {slug: sorted(numbers) for slug, numbers in found.items()}
 
 
 def parse_prs(text: str) -> dict[str, tuple[PullRequest, ...]] | None:
@@ -670,6 +858,7 @@ class RemoteReader:
             defaults=cached.defaults,
             tips=cached.branches,
             prs=cached.prs if cached.prs_known else None,
+            review=cached.review_prs if cached.review_prs_known else None,
             checkouts=checkouts,
             targets=self._targets(repos, checkouts, self._ref_lines(repos)),
         )
@@ -691,6 +880,9 @@ class RemoteReader:
         network call when the interval has not elapsed and ``force`` is unset.
         Finishes by calling :meth:`refresh_local`, so the states this leaves
         behind are already current against the tree.
+
+        The two PR searches run first, because the query that fills in each
+        PR's checks state needs their numbers to ask about.
         """
         if not (force or self.due(now)):
             return False
@@ -701,11 +893,17 @@ class RemoteReader:
         targets = self._targets(repos, checkouts, lines)
         wanted = self._wanted(repos, origins, targets)
 
-        defaults, tips = self._defaults(github_slugs(origins.values()), wanted)
+        prs = self._prs(_PR_SEARCH_ARGS)
+        review = self._prs(_REVIEW_SEARCH_ARGS)
+        slugs = github_slugs(origins.values())
+        asked = check_lookups(slugs, prs, review)
+
+        defaults, tips, states = self._defaults(slugs, wanted, asked)
         probed, probed_tips = self._probe(repos, origins, wanted)
         defaults.update(probed)
         tips.update(probed_tips)
-        prs = self._prs()
+        prs = None if prs is None else with_checks(prs, states)
+        review = None if review is None else with_checks(review, states)
 
         self._rebuild(
             repos,
@@ -713,12 +911,13 @@ class RemoteReader:
             defaults=defaults,
             tips=tips,
             prs=prs,
+            review=review,
             checkouts=checkouts,
             targets=targets,
         )
         self._read_at = now
         self._apply(self._covered(repos), lines, checkouts)
-        self._store(defaults, tips, prs, now)
+        self._store(defaults, tips, prs, review, now)
         return True
 
     def _rebuild(
@@ -729,6 +928,7 @@ class RemoteReader:
         defaults: Mapping[str, tuple[str, str]],
         tips: Mapping[str, Mapping[str, str]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
+        review: Mapping[str, tuple[PullRequest, ...]] | None,
         checkouts: Mapping[Path, str],
         targets: Mapping[Path, str],
     ) -> None:
@@ -739,6 +939,7 @@ class RemoteReader:
                 defaults=defaults,
                 tips=tips,
                 prs=prs,
+                review=review,
                 branch=checkouts.get(repo.path),
                 target=targets.get(repo.path),
             )
@@ -749,7 +950,8 @@ class RemoteReader:
         self,
         defaults: dict[str, tuple[str, str]],
         tips: dict[str, dict[str, str]],
-        prs: dict[str, tuple[PullRequest, ...]] | None,
+        prs: Mapping[str, tuple[PullRequest, ...]] | None,
+        review: Mapping[str, tuple[PullRequest, ...]] | None,
         now: float,
     ) -> None:
         """Hand this read to the cache, ignoring a write that could not land.
@@ -766,6 +968,8 @@ class RemoteReader:
                 branches=tips,
                 prs={} if prs is None else prs,
                 prs_known=prs is not None,
+                review_prs={} if review is None else review,
+                review_prs_known=review is not None,
             ),
         )
 
@@ -868,6 +1072,7 @@ class RemoteReader:
         defaults: Mapping[str, tuple[str, str]],
         tips: Mapping[str, Mapping[str, str]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
+        review: Mapping[str, tuple[PullRequest, ...]] | None,
         branch: str | None,
         target: str | None,
     ) -> RemoteState:
@@ -898,6 +1103,8 @@ class RemoteReader:
             default_known=answered,
             prs=() if slug is None or prs is None else prs.get(slug, ()),
             prs_known=slug is None or prs is not None,
+            review_prs=() if slug is None or review is None else review.get(slug, ()),
+            review_prs_known=slug is None or review is not None,
             branch=branch,
             branch_remote=remote_branch,
             branch_sha=(
@@ -1074,37 +1281,49 @@ class RemoteReader:
         self,
         slugs: Sequence[str],
         wanted: Mapping[str, Sequence[str]],
-    ) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
-        """Run the batched query and merge every chunk's defaults and branch tips."""
+        asked: Mapping[str, Sequence[int]] = _NO_CHECKS,
+    ) -> tuple[
+        dict[str, tuple[str, str]],
+        dict[str, dict[str, str]],
+        dict[str, dict[int, str]],
+    ]:
+        """Run the batched query and merge each chunk's branches and checks states."""
         if not slugs:
-            return {}, {}
+            return {}, {}, {}
         chunks = [
             tuple(slugs[start : start + BATCH_SIZE])
             for start in range(0, len(slugs), BATCH_SIZE)
         ]
 
-        def lookup(
-            chunk: tuple[str, ...],
-        ) -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+        def lookup(chunk: tuple[str, ...]) -> _Chunk:
             pairs = [(slug, name) for slug in chunk for name in wanted.get(slug, ())]
-            query = build_query(chunk, pairs)
+            checks = [
+                (slug, number) for slug in chunk for number in asked.get(slug, ())
+            ]
+            query = build_query(chunk, pairs, checks)
             out = self._gh(
                 ("api", "graphql", "-f", f"query={query}", *branch_variables(pairs)),
             )
             if out is None:
-                return {}, {}
-            return parse_defaults(out, chunk), parse_branch_tips(out, chunk, pairs)
+                return {}, {}, {}
+            return (
+                parse_defaults(out, chunk),
+                parse_branch_tips(out, chunk, pairs),
+                parse_check_states(out, chunk, checks),
+            )
 
         merged: dict[str, tuple[str, str]] = {}
         tips: dict[str, dict[str, str]] = {}
-        for found, branches in self._map(lookup, chunks):
+        states: dict[str, dict[int, str]] = {}
+        for found, branches, rollups in self._map(lookup, chunks):
             merged.update(found)
             tips.update(branches)
-        return merged, tips
+            states.update(rollups)
+        return merged, tips, states
 
-    def _prs(self) -> dict[str, tuple[PullRequest, ...]] | None:
-        """Run the one search that covers every repo, or return None on failure."""
-        out = self._gh(_PR_SEARCH_ARGS)
+    def _prs(self, args: Sequence[str]) -> dict[str, tuple[PullRequest, ...]] | None:
+        """Run one PR search across every repo, or return None on failure."""
+        out = self._gh(args)
         return None if out is None else parse_prs(out)
 
     def _map[T, R](self, work: Callable[[T], R], items: Sequence[T]) -> list[R]:

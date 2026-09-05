@@ -28,9 +28,9 @@ Each row is one repo:
 | Repo, Branch | Name and current branch. The name takes a color per origin host and owner, so clones under one owner match |
 | HEAD | Subject of the last commit |
 | Last commit | Age of that commit |
-| State | `S2 M1 ?3` is two staged files, one modified, three untracked |
+| State | `S2 M1 ?3` is two staged files, one modified, three untracked. `U2` is two conflicted paths, `rebase` a rebase you stopped in the middle of, `stash 2` two entries on the stash. Red means something is halted and waiting on you |
 | `↑↓` | Commits ahead of and behind the upstream |
-| Remote, PR | Which branch the origin has moved on, and your open PRs. `behind origin/fix` is the checked-out branch, `behind main` the default one. PRs come from GitHub; the branches come from any origin |
+| Remote, PR | Which branch the origin has moved on, and the pull requests in play. `behind origin/fix` is the checked-out branch, `behind main` the default one. `2 ✗  3 to review` is two PRs of yours with one failing its checks, and three waiting on your review. PRs come from GitHub; the branches come from any origin |
 | Active | When you last touched the repo |
 
 Active counts working-tree edits, not just commits, so an hour of uncommitted
@@ -38,9 +38,10 @@ work still sorts you to the top.
 
 | Key | Does |
 |-----|------|
-| `enter` | On a fold row, show or hide that repo's remaining worktrees. Otherwise detail for the selected repo: remote state, your open PRs, changed files, branches, recent HEAD movements |
+| `enter` | On a fold row, show or hide that repo's remaining worktrees. Otherwise detail for the selected repo: remote state, your open PRs, the PRs awaiting your review, what is halted or stashed, changed files, branches, recent HEAD movements |
 | `a` | Activity feed across all repos, read from their reflogs |
 | `d` `u` `b` `p` | Filter to dirty / unpushed / behind / has-open-PR |
+| `/` | Filter by repo name as you type; `escape` clears it. Composes with the toggles above |
 | `s` | Sort by recent, name, or dirty |
 | `t` | Window: all, 1h, 1d, 7d, 30d |
 | `D` | Toggle the selected repo dormant, and write that to the config file |
@@ -57,11 +58,13 @@ cboard2 ls                  # the table, as plain columns
 cboard2 ls --remote         # add the remote columns, served from the cache
 cboard2 json --since 2h     # the same rows as JSON
 cboard2 busy --since 5m     # exit 0 if anything moved in the last 5 minutes
+cboard2 busy --remote       # exit 0 if anything is behind or has a PR too
 ```
 
 `busy` is meant for a tmux statusline or a shell guard. `--since` takes `30s`,
-`5m`, `2h`, `1d`. `--refresh` asks the origins now instead of reading the cache,
-and implies `--remote`.
+`5m`, `2h`, `1d`. `--remote` counts a repo behind its origin or holding an open
+pull request as busy, alongside local activity, and reads the cache rather than
+the network. `--refresh` asks the origins now instead, and implies `--remote`.
 
 ## Config
 
@@ -104,7 +107,9 @@ that row shows them all, and `enter` again folds them back.
 Two git calls per repo feed the table. `status --porcelain=v2 --branch` gives the
 branch, dirty counts and ahead/behind; `log -1` gives the HEAD subject and its age.
 Both run across a thread pool: 94 repos in 0.28s on the author's machine, which
-makes a 2-second poll affordable.
+makes a 2-second poll affordable. A halted merge or rebase and the stash depth
+cost no third call: `MERGE_HEAD`, `rebase-merge` and the stash reflog are files
+in the git directory, read where they sit.
 The `--no-optional-locks` flag keeps the poller from taking `.git/index.lock`
 while you are running git yourself.
 
@@ -112,8 +117,9 @@ Recent activity comes from each repo's reflog, which already records every HEAD
 movement with a timestamp and a verb. Working-tree edits touch nothing under
 `.git`, so "last edited" is the newest mtime among the paths git reports dirty.
 
-The remote columns come from one batched GraphQL query for default branches and
-checked-out branches, and one `gh search prs` for your open PRs. An origin that
+The remote columns come from two `gh search prs` calls — one for the PRs you
+wrote, one for the PRs awaiting your review — and one batched GraphQL query for
+default branches, checked-out branches and each PR's checks rollup. An origin that
 is not on github.com gets `git ls-remote --symref origin HEAD` instead, with the
 same branches named as extra refs, so a self-hosted or GitLab remote still
 reports both; those repos show no PRs. cboard2 never fetches: rewriting

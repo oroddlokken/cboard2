@@ -61,6 +61,7 @@ def _pr(
     ago: float,
     now: float,
     draft: bool = False,
+    checks: str = "passing",
 ) -> PullRequest:
     """Build one open pull request on ``slug``."""
     return PullRequest(
@@ -69,6 +70,7 @@ def _pr(
         url=f"https://github.com/{slug}/pull/{number}",
         draft=draft,
         updated_at=now - ago,
+        checks=checks,
     )
 
 
@@ -78,6 +80,7 @@ def _known(
     behind: bool = False,
     behind_branch: str | None = None,
     prs: tuple[PullRequest, ...] = (),
+    review_prs: tuple[PullRequest, ...] = (),
 ) -> RemoteState:
     """Return a remote reading where both GitHub calls answered for ``name``.
 
@@ -92,6 +95,8 @@ def _known(
         default_known=True,
         prs=prs,
         prs_known=True,
+        review_prs=review_prs,
+        review_prs_known=True,
         behind_default=behind,
         branch=behind_branch,
         branch_remote=behind_branch,
@@ -119,6 +124,7 @@ def _offsite(
         default_sha=_sha(name),
         default_known=True,
         prs_known=True,
+        review_prs_known=True,
         behind_default=behind,
     )
 
@@ -143,6 +149,9 @@ def _row(
     staged: int = 0,
     unstaged: int = 0,
     untracked: int = 0,
+    unmerged: int = 0,
+    operation: str = "none",
+    stashed: int = 0,
     ahead: int = 0,
     behind: int = 0,
     dirty_paths: tuple[str, ...] = (),
@@ -152,7 +161,7 @@ def _row(
     main_git_dir: Path | None = None,
 ) -> Row:
     """Build one row as if the pollers had read this repo ``ago`` seconds back."""
-    dirty = staged + unstaged + untracked
+    dirty = staged + unstaged + untracked + unmerged
     state = RepoState(
         path=DEMO_ROOT / name,
         name=name,
@@ -167,6 +176,9 @@ def _row(
         staged=staged,
         unstaged=unstaged,
         untracked=untracked,
+        unmerged=unmerged,
+        operation=operation,
+        stashed=stashed,
         ahead=ahead,
         behind=behind,
         upstream=None if branch is None else f"origin/{branch}",
@@ -188,6 +200,23 @@ def _featured(now: float) -> list[Row]:
                 f"{_OWNER}/orbit-web",
                 ago=18 * MINUTE,
                 now=now,
+                checks="failing",
+            ),
+        ),
+        review_prs=(
+            _pr(
+                409,
+                "Drop the legacy checkout banner",
+                f"{_OWNER}/orbit-web",
+                ago=50 * MINUTE,
+                now=now,
+            ),
+            _pr(
+                405,
+                "Bump the design tokens to 3.1",
+                f"{_OWNER}/orbit-web",
+                ago=6 * HOUR,
+                now=now,
             ),
         ),
     )
@@ -208,6 +237,16 @@ def _featured(now: float) -> list[Row]:
                 ago=2 * DAY,
                 now=now,
                 draft=True,
+                checks="pending",
+            ),
+        ),
+        review_prs=(
+            _pr(
+                1169,
+                "Add a metrics endpoint for the signer",
+                f"{_OWNER}/acme-api",
+                ago=4 * HOUR,
+                now=now,
             ),
         ),
     )
@@ -248,7 +287,16 @@ def _featured(now: float) -> list[Row]:
             "ledger-sync",
             now=now,
             ago=25 * MINUTE,
+            branch="chore/rebase-onto-main",
             subject="Retry the settlement fetch on a 502",
+            operation="rebase",
+            unmerged=2,
+            unstaged=1,
+            dirty_paths=(
+                "src/ledger/settlement.py",
+                "src/ledger/retry.py",
+                "tests/test_settlement.py",
+            ),
             remote=_known("ledger-sync", behind=True),
         ),
         _row(
@@ -270,6 +318,7 @@ def _featured(now: float) -> list[Row]:
             subject="Rotate signing keys without dropping in-flight requests",
             staged=1,
             unstaged=2,
+            stashed=2,
             ahead=4,
             main_git_dir=DEMO_ROOT / "acme-api" / ".git",
             remote=api,

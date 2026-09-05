@@ -17,12 +17,14 @@ from typing import TYPE_CHECKING
 from cboard2.board import Board
 from cboard2.config import ConfigError, load_config
 from cboard2.duration import parse_duration
-from cboard2.remote import ORIGIN
+from cboard2.gitstate import state_parts
+from cboard2.remote import ORIGIN, checks_mark, worst_checks
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from cboard2.board import Row
+    from cboard2.remote import PullRequest
 
 _BUSY_DEFAULT = 30.0
 """Seconds ``busy`` looks back over when no window is given."""
@@ -52,13 +54,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     board = Board(config)
     since: float | None = args.since
-    if args.command == "busy":
-        return cmd_busy(board, _BUSY_DEFAULT if since is None else since)
-    if args.remote or args.refresh:
+    remote = args.remote or args.refresh
+    if remote:
         board.read_remote(force=args.refresh)
+    if args.command == "busy":
+        window = _BUSY_DEFAULT if since is None else since
+        return cmd_busy(board, window, remote=remote)
     if args.command == "json":
         return cmd_json(board, since)
-    return cmd_ls(board, since, remote=args.remote or args.refresh)
+    return cmd_ls(board, since, remote=remote)
 
 
 def duration(text: str) -> float:
@@ -90,16 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
             type=duration,
             help="only count repos active within this window, e.g. 30s, 5m, 2h, 1d",
         )
-        if name == "busy":
-            child.set_defaults(remote=False, refresh=False)
-            continue
         child.add_argument(
             "--remote",
             action="store_true",
             help=(
-                "also show whether the default branch has been pulled and "
-                "which PRs you have open, served from the cache when it is "
-                "younger than remote_interval; without it nothing is read"
+                "also read whether a branch has been pulled and which PRs are "
+                "open, served from the cache when it is younger than "
+                "remote_interval; without it nothing is read"
             ),
         )
         child.add_argument(
@@ -137,10 +138,37 @@ def cmd_json(board: Board, since: float | None, *, now: float | None = None) -> 
     return 0
 
 
-def cmd_busy(board: Board, since: float, *, now: float | None = None) -> int:
-    """Exit 0 when any repo was active inside the window, 1 otherwise."""
+def cmd_busy(
+    board: Board,
+    since: float,
+    *,
+    now: float | None = None,
+    remote: bool = False,
+) -> int:
+    """Exit 0 when any repo is busy, 1 otherwise.
+
+    Local activity inside the window always counts. ``remote`` adds the repos
+    the last remote read left behind their origin or holding a pull request,
+    which a prompt asks about precisely because they show no local activity.
+    """
     moment = time.time() if now is None else now
-    return 0 if _select(board, since, moment) else 1
+    rows = board.refresh(now=moment)
+    if any(row.active_at >= moment - since for row in rows):
+        return 0
+    if remote and any(waiting(row) for row in rows):
+        return 0
+    return 1
+
+
+def waiting(row: Row) -> bool:
+    """Return True when the origin holds something this repo has not dealt with."""
+    remote = row.remote
+    return bool(
+        remote.behind_default
+        or remote.behind_branch
+        or remote.prs
+        or remote.review_prs,
+    )
 
 
 def as_dict(row: Row) -> dict[str, object]:
@@ -160,6 +188,9 @@ def as_dict(row: Row) -> dict[str, object]:
         "staged": state.staged,
         "unstaged": state.unstaged,
         "untracked": state.untracked,
+        "unmerged": state.unmerged,
+        "operation": state.operation,
+        "stashed": state.stashed,
         "ahead": state.ahead,
         "behind": state.behind,
         "upstream": state.upstream,
@@ -186,16 +217,21 @@ def _remote_dict(row: Row) -> dict[str, object]:
         "branch_known": remote.branch_known,
         "behind_branch": remote.behind_branch,
         "prs_known": remote.prs_known,
-        "prs": [
-            {
-                "number": pr.number,
-                "title": pr.title,
-                "url": pr.url,
-                "draft": pr.draft,
-                "updated_at": pr.updated_at,
-            }
-            for pr in remote.prs
-        ],
+        "prs": [_pr_dict(pr) for pr in remote.prs],
+        "review_prs_known": remote.review_prs_known,
+        "review_prs": [_pr_dict(pr) for pr in remote.review_prs],
+    }
+
+
+def _pr_dict(pr: PullRequest) -> dict[str, object]:
+    """Return one pull request as JSON-ready fields."""
+    return {
+        "number": pr.number,
+        "title": pr.title,
+        "url": pr.url,
+        "draft": pr.draft,
+        "updated_at": pr.updated_at,
+        "checks": pr.checks,
     }
 
 
@@ -245,17 +281,35 @@ def remote_text(row: Row) -> str:
 
 
 def pr_text(row: Row) -> str:
-    """Return the count of the user's open PRs, and how many are drafts."""
+    """Return the user's own open PRs and how many wait on their review.
+
+    The two are separate counts because they ask for different work: one is
+    theirs to land, the other is somebody else's to unblock.
+    """
     state = row.remote
-    if not state.prs_known:
+    if not (state.prs_known or state.review_prs_known):
         return "?"
+    parts = [part for part in (own_pr_text(row), review_pr_text(row)) if part]
+    return "  ".join(parts) or "—"
+
+
+def own_pr_text(row: Row) -> str:
+    """Return the user's open PR count, its drafts and its worst checks state."""
+    state = row.remote
     if not state.prs:
-        return "—"
-    drafts = state.draft_count
+        return ""
     label = str(len(state.prs))
+    drafts = state.draft_count
     if drafts:
         label += f" ({drafts} draft{'s' if drafts > 1 else ''})"
-    return label
+    mark = checks_mark(worst_checks(state.prs))
+    return f"{label} {mark}" if mark else label
+
+
+def review_pr_text(row: Row) -> str:
+    """Return how many PRs are waiting on the user's review here."""
+    count = len(row.remote.review_prs)
+    return f"{count} to review" if count else ""
 
 
 def branch_text(row: Row) -> str:
@@ -278,20 +332,12 @@ def head_text(row: Row) -> str:
 
 
 def state_text(row: Row) -> str:
-    """Return the dirty counts as ``S`` staged, ``M`` unstaged, ``?`` untracked."""
-    state = row.state
-    if state.dirty == 0:
-        return "clean"
-    parts = [
-        f"{prefix}{count}"
-        for prefix, count in (
-            ("S", state.staged),
-            ("M", state.unstaged),
-            ("?", state.untracked),
-        )
-        if count
-    ]
-    return " ".join(parts)
+    """Return the halted operation, the dirty counts and the stash depth.
+
+    The counts are ``U`` conflicted, ``S`` staged, ``M`` unstaged and ``?``
+    untracked.
+    """
+    return " ".join(state_parts(row.state)) or "clean"
 
 
 def ab_text(row: Row) -> str:

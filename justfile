@@ -27,11 +27,11 @@ lint-all:
 
 # find dead code with vulture
 # Textual dispatches by name: an action_* method is reached through a Binding
-# string, an on_* handler through an event class, and BINDINGS/CSS/TITLE are
-# read by the framework. Vulture sees none of that.
+# string, an on_* handler through an event class, and BINDINGS/CSS/TITLE/
+# AUTO_FOCUS are read by the framework. Vulture sees none of that.
 vulture:
     uv run vulture src tests vulture_whitelist.py \
-      --ignore-names 'action_*,on_*,watch_*,validate_*,compose,BINDINGS,CSS,TITLE,cursor_type,sub_title'
+      --ignore-names 'action_*,on_*,watch_*,validate_*,compose,BINDINGS,CSS,TITLE,AUTO_FOCUS,cursor_type,sub_title'
 
 # run tests
 test:

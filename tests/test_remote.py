@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -11,11 +12,17 @@ import pytest
 
 from cboard2.discovery import Repo
 from cboard2.remote import (
+    CHECKS_FAILING,
+    CHECKS_NONE,
+    CHECKS_PASSING,
+    CHECKS_PENDING,
+    CHECKS_UNKNOWN,
     Cached,
     PullRequest,
     RemoteReader,
     branch_variables,
     build_query,
+    checks_mark,
     github_slugs,
     origin_key,
     parse_branch_tips,
@@ -29,6 +36,7 @@ from cboard2.remote import (
     parse_worktrees,
     run_gh,
     target_branch,
+    worst_checks,
 )
 
 if TYPE_CHECKING:
@@ -70,17 +78,31 @@ class FakeGit:
 
 
 class FakeGh:
-    """A gh runner returning canned output for the two calls the reader makes."""
+    """A gh runner returning canned output for the three calls the reader makes.
 
-    def __init__(self, *, graphql: str | None, prs: str | None) -> None:
+    ``review`` defaults to an empty result rather than to ``prs``: most tests
+    are about the authored search, and echoing it back would put the same PR
+    on both lists.
+    """
+
+    def __init__(
+        self,
+        *,
+        graphql: str | None,
+        prs: str | None,
+        review: str | None = "[]",
+    ) -> None:
         self.graphql = graphql
         self.prs = prs
+        self.review = review
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, args: Sequence[str]) -> str | None:
         """Record the call and answer by which gh command it is."""
         self.calls.append(tuple(args))
-        return self.graphql if args[0] == "api" else self.prs
+        if args[0] == "api":
+            return self.graphql
+        return self.review if "--review-requested=@me" in args else self.prs
 
 
 def _repo(root: Path, name: str) -> Repo:
@@ -136,6 +158,35 @@ def _graphql(*entries: tuple[str, str] | None) -> str:
                 "defaultBranchRef": {"name": branch, "target": {"oid": oid}}
             }
     return json.dumps({"data": data})
+
+
+def _graphql_entry(
+    default: tuple[str, str] | None = ("main", REMOTE_SHA),
+    **fields: object,
+) -> str:
+    """Build a one-repo response carrying its default branch and extra aliases."""
+    entry: dict[str, object] = {
+        "defaultBranchRef": None
+        if default is None
+        else {"name": default[0], "target": {"oid": default[1]}},
+        **fields,
+    }
+    return json.dumps({"data": {"r0": entry}})
+
+
+def _rollup(state: str | None) -> dict[str, object]:
+    """Build one ``pullRequest`` entry's commits-and-rollup nesting."""
+    return {
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "statusCheckRollup": None if state is None else {"state": state}
+                    }
+                },
+            ],
+        },
+    }
 
 
 def _pr_object(number: int, *, draft: bool = False) -> PullRequest:
@@ -706,10 +757,10 @@ def test_a_second_read_inside_the_interval_makes_no_call(tmp_path: Path) -> None
 
     assert reader.read([repo], NOW) is True
     assert reader.read([repo], NOW + 299.0) is False
-    assert len(gh.calls) == 2
+    assert len(gh.calls) == 3
 
     assert reader.read([repo], NOW + 300.0) is True
-    assert len(gh.calls) == 4
+    assert len(gh.calls) == 6
 
 
 def test_force_ignores_the_interval(tmp_path: Path) -> None:
@@ -737,7 +788,7 @@ def test_the_query_is_chunked(tmp_path: Path) -> None:
 
     graphql_calls = [args for args in gh.calls if args[0] == "api"]
     assert len(graphql_calls) == 3
-    assert len([args for args in gh.calls if args[0] == "search"]) == 1
+    assert len([args for args in gh.calls if args[0] == "search"]) == 2
 
 
 def test_forget_absent_drops_a_deleted_repo(tmp_path: Path) -> None:
@@ -766,7 +817,7 @@ def test_no_repos_skips_the_default_branch_query() -> None:
     reader = RemoteReader(runner=git, gh=gh)
 
     assert reader.read([], NOW) is True
-    assert [args[0] for args in gh.calls] == ["search"]
+    assert [args[0] for args in gh.calls] == ["search", "search"]
     assert git.calls == []
 
 
@@ -982,7 +1033,7 @@ def test_a_worktree_shares_its_repos_remote_reading(tmp_path: Path) -> None:
     assert made.count((main.path, "for-each-ref")) == 1
     assert made.count((main.path, "merge-base")) == 1
     assert [call for call in made if call[0] == side.path] == []
-    assert gh.calls[0][-1].count('name: "one"') == 1
+    assert gh.calls[-1][-1].count('name: "one"') == 1
     for path in (main.path, side.path):
         state = reader.cached(path)
         assert state.slug == "acme/one"
@@ -1205,7 +1256,7 @@ def test_a_renamed_upstream_is_asked_about_under_the_origins_name(
     reader = RemoteReader(runner=git, gh=gh)
     reader.read([repo], NOW)
 
-    assert "b0=refs/heads/their-fix" in gh.calls[0]
+    assert "b0=refs/heads/their-fix" in gh.calls[-1]
     state = reader.cached(repo.path)
     assert state.branch_remote == "their-fix"
     assert state.behind_branch is True
@@ -1382,8 +1433,8 @@ def test_two_worktrees_ask_about_both_branches_in_one_query(tmp_path: Path) -> N
     reader = RemoteReader(runner=git, gh=gh)
     reader.read([main, side], NOW)
 
-    assert "b0=refs/heads/fix" in gh.calls[0]
-    assert "b1=refs/heads/spike" in gh.calls[0]
+    assert "b0=refs/heads/fix" in gh.calls[-1]
+    assert "b1=refs/heads/spike" in gh.calls[-1]
     assert [args[0] for _, args in git.calls].count("worktree") == 1
     assert reader.cached(main.path).branch_remote == "fix"
     assert reader.cached(side.path).branch_remote == "spike"
@@ -1423,3 +1474,190 @@ def test_prime_serves_the_stored_branch_tips(tmp_path: Path) -> None:
     state = reader.cached(repo.path)
     assert state.branch_remote == "fix"
     assert state.behind_branch is True
+
+
+def test_a_review_requested_pr_lands_on_its_own_list(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("SUCCESS")),
+        prs="[]",
+        review=json.dumps([_pr("acme/one", 12, title="Their change")]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    state = reader.cached(repo.path)
+
+    assert state.prs == ()
+    assert state.prs_known is True
+    assert [pr.number for pr in state.review_prs] == [12]
+    assert state.review_prs[0].title == "Their change"
+    assert state.review_prs_known is True
+
+
+def test_a_failing_rollup_reaches_the_pull_request(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("FAILURE")),
+        prs=json.dumps([_pr("acme/one", 4)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    state = reader.cached(repo.path)
+
+    assert state.prs[0].checks == CHECKS_FAILING
+    assert worst_checks(state.prs) == CHECKS_FAILING
+    assert checks_mark(CHECKS_FAILING) == "✗"
+
+
+@pytest.mark.parametrize(
+    ("rollup", "expected"),
+    [
+        ("SUCCESS", CHECKS_PASSING),
+        ("FAILURE", CHECKS_FAILING),
+        ("ERROR", CHECKS_FAILING),
+        ("PENDING", CHECKS_PENDING),
+        ("EXPECTED", CHECKS_PENDING),
+        (None, CHECKS_NONE),
+    ],
+)
+def test_every_rollup_state_maps_to_one_checks_value(
+    tmp_path: Path,
+    rollup: str | None,
+    expected: str,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup(rollup)),
+        prs=json.dumps([_pr("acme/one", 4)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+
+    assert reader.cached(repo.path).prs[0].checks == expected
+
+
+def test_a_repo_holding_both_kinds_keeps_them_apart(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("SUCCESS"), c1=_rollup("FAILURE")),
+        prs=json.dumps([_pr("acme/one", 4)]),
+        review=json.dumps([_pr("acme/one", 9)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    state = reader.cached(repo.path)
+
+    assert [pr.number for pr in state.prs] == [4]
+    assert [pr.number for pr in state.review_prs] == [9]
+    assert state.prs[0].checks == CHECKS_PASSING
+    assert state.review_prs[0].checks == CHECKS_FAILING
+
+
+def test_the_query_asks_about_each_found_pr_once(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("SUCCESS")),
+        prs=json.dumps([_pr("acme/one", 4)]),
+        review=json.dumps([_pr("acme/one", 4), _pr("other/repo", 8)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    query = gh.calls[-1][-1]
+
+    assert query.count("pullRequest(number: 4)") == 1
+    assert "pullRequest(number: 8)" not in query
+
+
+def test_a_failed_query_leaves_the_prs_listed_with_unknown_checks(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(graphql=None, prs=json.dumps([_pr("acme/one", 4)]))
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    state = reader.cached(repo.path)
+
+    assert [pr.number for pr in state.prs] == [4]
+    assert state.prs[0].checks == CHECKS_UNKNOWN
+
+
+def test_a_failed_review_search_is_unknown_without_blanking_the_others(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("SUCCESS")),
+        prs=json.dumps([_pr("acme/one", 4)]),
+        review=None,
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+    reader.read([repo], NOW)
+    state = reader.cached(repo.path)
+
+    assert state.prs_known is True
+    assert state.review_prs_known is False
+    assert state.review_prs == ()
+
+
+def test_a_cache_from_before_review_prs_reads_as_unknown(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    stale = Cached(
+        read_at=NOW,
+        defaults={"acme/one": ("main", REMOTE_SHA)},
+        prs={"acme/one": (_pr_object(4),)},
+        prs_known=True,
+    )
+    reader = RemoteReader(
+        runner=git,
+        gh=FakeGh(graphql=None, prs=None),
+        load=lambda: stale,
+    )
+
+    assert reader.prime([repo]) is True
+    state = reader.cached(repo.path)
+
+    assert [pr.number for pr in state.prs] == [4]
+    assert state.prs[0].checks == CHECKS_UNKNOWN
+    assert state.review_prs == ()
+    assert state.review_prs_known is False
+
+
+def test_both_pr_lists_are_stored_for_the_next_process(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql_entry(c0=_rollup("PENDING"), c1=_rollup("SUCCESS")),
+        prs=json.dumps([_pr("acme/one", 4)]),
+        review=json.dumps([_pr("acme/one", 9)]),
+    )
+    saved: list[Cached] = []
+    reader = RemoteReader(
+        runner=git, gh=gh, save=lambda cached: bool(saved.append(cached)) or True
+    )
+    reader.read([repo], NOW)
+
+    assert saved[-1].prs_known is True
+    assert saved[-1].review_prs_known is True
+    assert [pr.number for pr in saved[-1].review_prs["acme/one"]] == [9]
+    assert saved[-1].prs["acme/one"][0].checks == CHECKS_PENDING
+
+
+def test_worst_checks_ranks_the_state_worth_acting_on_first() -> None:
+    failing = replace(_pr_object(1), checks=CHECKS_FAILING)
+    pending = replace(_pr_object(2), checks=CHECKS_PENDING)
+    passing = replace(_pr_object(3), checks=CHECKS_PASSING)
+
+    assert worst_checks([passing, pending, failing]) == CHECKS_FAILING
+    assert worst_checks([passing, pending]) == CHECKS_PENDING
+    assert worst_checks([passing]) == CHECKS_PASSING
+    assert worst_checks([]) == CHECKS_UNKNOWN
+    assert checks_mark(CHECKS_UNKNOWN) == ""
+    assert checks_mark(CHECKS_NONE) == ""

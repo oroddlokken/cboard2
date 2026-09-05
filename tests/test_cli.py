@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from conftest import git
 
-from cboard2.board import Board
+from cboard2.board import Board, Row
 from cboard2.cli import (
     build_parser,
     cmd_busy,
@@ -17,15 +18,16 @@ from cboard2.cli import (
     cmd_ls,
     format_table,
     relative,
+    state_text,
 )
 from cboard2.config import Config
+from cboard2.gitstate import RepoState
 from cboard2.remote import RemoteReader
 from cboard2.remotecache import load as load_cache
 from cboard2.remotecache import save as save_cache
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
 NOW = 1_800_000_000.0
 """A fixed clock, for the tests that only check rendering."""
@@ -52,7 +54,12 @@ def _board(root: Path, *, remote: bool = False) -> Board:
 
 
 class _RecordingGh:
-    """A gh runner that records every call and answers from a script."""
+    """A gh runner that records every call and answers from a script.
+
+    Keyed by gh subcommand, except that a ``review`` entry answers the
+    review-requested search on its own; without one both searches share the
+    ``search`` entry.
+    """
 
     def __init__(self, answers: dict[str, str]) -> None:
         self.answers = answers
@@ -61,6 +68,8 @@ class _RecordingGh:
     def __call__(self, args: Sequence[str]) -> str | None:
         """Record the call and answer by which gh command it is."""
         self.calls.append(tuple(args))
+        if args[0] == "search" and "--review-requested=@me" in args:
+            return self.answers.get("review", self.answers.get("search"))
         return self.answers.get(args[0])
 
 
@@ -231,14 +240,35 @@ def test_relative_renders_an_age(seconds: float, expected: str) -> None:
     assert relative(seconds) == expected
 
 
-def _graphql(branch: str, oid: str, tip: str | None = None) -> str:
-    """Build a one-repo answer, with ``tip`` as the ``b0`` branch lookup."""
+def _graphql(
+    branch: str,
+    oid: str,
+    tip: str | None = None,
+    checks: dict[str, str] | None = None,
+) -> str:
+    """Build a one-repo answer, with ``tip`` as ``b0`` and ``checks`` as ``c<n>``."""
     entry: dict[str, object] = {
         "defaultBranchRef": {"name": branch, "target": {"oid": oid}},
     }
     if tip is not None:
         entry["b0"] = {"target": {"oid": tip}}
+    for alias, state in (checks or {}).items():
+        entry[alias] = {
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": state}}}]},
+        }
     return json.dumps({"data": {"r0": entry}})
+
+
+def _search_pr(number: int, *, draft: bool = False) -> dict[str, object]:
+    """Build one ``gh search prs`` result on ``acme/repo``."""
+    return {
+        "number": number,
+        "title": f"Change {number}",
+        "url": f"https://github.com/acme/repo/pull/{number}",
+        "isDraft": draft,
+        "updatedAt": "2026-09-04T12:00:35Z",
+        "repository": {"name": "repo", "nameWithOwner": "acme/repo"},
+    }
 
 
 def test_bare_ls_leaves_the_remote_columns_out(
@@ -291,7 +321,7 @@ def test_remote_flag_adds_the_two_columns(
     assert "REMOTE" in lines[0].split()
     assert "behind main" in lines[1]
     assert "1 (1 draft)" in lines[1]
-    assert [args[0] for args in gh.calls] == ["api", "search"]
+    assert [args[0] for args in gh.calls] == ["search", "search", "api"]
 
 
 def test_the_remote_column_names_a_branch_behind_its_origin_copy(
@@ -341,6 +371,8 @@ def test_json_always_carries_the_remote_object(
         "behind_branch": False,
         "prs_known": False,
         "prs": [],
+        "review_prs_known": False,
+        "review_prs": [],
     }
 
 
@@ -373,7 +405,7 @@ def test_a_warm_cache_serves_ls_remote_with_no_gh_call(
     )
     board = _remote_board(git_repo.parent, first, cache=cache)
     assert board.read_remote() is True
-    assert [args[0] for args in first.calls] == ["api", "search"]
+    assert [args[0] for args in first.calls] == ["search", "search", "api"]
 
     second = _RecordingGh({})
     warm = _remote_board(git_repo.parent, second, cache=cache)
@@ -403,7 +435,7 @@ def test_refresh_ignores_a_warm_cache(
     again = _remote_board(git_repo.parent, forced, cache=cache)
 
     assert again.read_remote(force=True) is True
-    assert [args[0] for args in forced.calls] == ["api", "search"]
+    assert [args[0] for args in forced.calls] == ["search", "search", "api"]
 
 
 def test_a_pull_clears_behind_from_the_cache_alone(
@@ -451,3 +483,184 @@ def test_ls_and_json_name_the_repo_a_worktree_belongs_to(
     assert rows[worktree.name]["worktree_of"] == str(git_repo / ".git")
     assert rows[worktree.name]["branch"] == "side"
     assert rows[git_repo.name]["worktree_of"] is None
+
+
+def _dirty_row(
+    *,
+    operation: str = "none",
+    unmerged: int = 0,
+    unstaged: int = 0,
+    stashed: int = 0,
+) -> Row:
+    """Build a row with no repo behind it, for the renderers alone."""
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=NOW,
+        branch="main",
+        operation=operation,
+        unmerged=unmerged,
+        unstaged=unstaged,
+        stashed=stashed,
+    )
+    return Row(state=state, moved_at=NOW)
+
+
+def test_the_state_column_names_the_halted_operation_and_the_conflicts() -> None:
+    row = _dirty_row(operation="rebase", unmerged=2, unstaged=1)
+
+    assert state_text(row) == "rebase U2 M1"
+
+
+def test_the_state_column_shows_a_stash_on_a_clean_tree() -> None:
+    assert state_text(_dirty_row(stashed=3)) == "stash 3"
+    assert state_text(_dirty_row()) == "clean"
+
+
+def test_json_carries_the_conflict_operation_and_stash_fields(
+    git_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cmd_json(_board(git_repo.parent), None, now=NOW) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+
+    assert row["unmerged"] == 0
+    assert row["operation"] == "none"
+    assert row["stashed"] == 0
+
+
+def test_the_pr_column_separates_own_prs_from_the_review_queue(
+    git_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    head = git(git_repo, "rev-parse", "HEAD").strip()
+    gh = _RecordingGh(
+        {
+            "api": _graphql("main", head),
+            "search": json.dumps([_search_pr(4)]),
+            "review": json.dumps([_search_pr(9), _search_pr(11)]),
+        },
+    )
+    board = _remote_board(git_repo.parent, gh)
+    assert board.read_remote(force=True) is True
+
+    assert cmd_ls(board, None, now=NOW, remote=True) == 0
+    lines = capsys.readouterr().out.splitlines()
+
+    assert "1" in lines[1]
+    assert "2 to review" in lines[1]
+
+
+def test_the_pr_column_marks_a_failing_check(
+    git_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    head = git(git_repo, "rev-parse", "HEAD").strip()
+    gh = _RecordingGh(
+        {
+            "api": _graphql("main", head, checks={"c0": "FAILURE"}),
+            "search": json.dumps([_search_pr(4)]),
+            "review": json.dumps([]),
+        },
+    )
+    board = _remote_board(git_repo.parent, gh)
+    assert board.read_remote(force=True) is True
+
+    assert cmd_ls(board, None, now=NOW, remote=True) == 0
+
+    assert "1 ✗" in capsys.readouterr().out.splitlines()[1]
+
+
+def test_busy_remote_exits_zero_for_a_repo_behind_with_no_local_activity(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    gh = _RecordingGh(
+        {"api": _graphql("main", "f" * 40), "search": json.dumps([])},
+    )
+    board = _remote_board(git_repo.parent, gh, cache=tmp_path / "remote.json")
+    assert board.read_remote(force=True) is True
+    later = _now() + 86400 * 30
+
+    assert cmd_busy(board, 30.0, now=later) == 1
+    assert cmd_busy(board, 30.0, now=later, remote=True) == 0
+
+
+def test_busy_remote_exits_zero_for_a_repo_with_an_open_pr(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    head = git(git_repo, "rev-parse", "HEAD").strip()
+    gh = _RecordingGh(
+        {
+            "api": _graphql("main", head),
+            "search": json.dumps([_search_pr(4)]),
+            "review": json.dumps([]),
+        },
+    )
+    board = _remote_board(git_repo.parent, gh, cache=tmp_path / "remote.json")
+    assert board.read_remote(force=True) is True
+
+    assert cmd_busy(board, 30.0, now=_now() + 86400 * 30, remote=True) == 0
+
+
+def test_busy_remote_exits_one_when_nothing_is_waiting(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    head = git(git_repo, "rev-parse", "HEAD").strip()
+    gh = _RecordingGh(
+        {"api": _graphql("main", head), "search": json.dumps([])},
+    )
+    board = _remote_board(git_repo.parent, gh, cache=tmp_path / "remote.json")
+    assert board.read_remote(force=True) is True
+
+    assert cmd_busy(board, 30.0, now=_now() + 86400 * 30, remote=True) == 1
+
+
+def test_busy_remote_reads_the_cache_without_invoking_gh(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    cache = tmp_path / "remote.json"
+    first = _RecordingGh(
+        {"api": _graphql("main", "f" * 40), "search": json.dumps([])},
+    )
+    assert _remote_board(git_repo.parent, first, cache=cache).read_remote() is True
+
+    second = _RecordingGh({})
+    warm = _remote_board(git_repo.parent, second, cache=cache)
+    assert warm.read_remote() is True
+
+    assert second.calls == []
+    assert cmd_busy(warm, 30.0, now=_now() + 86400 * 30, remote=True) == 0
+
+
+def test_busy_without_remote_keeps_todays_exit_codes(
+    git_repo: Path,
+    tmp_path: Path,
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    gh = _RecordingGh(
+        {"api": _graphql("main", "f" * 40), "search": json.dumps([])},
+    )
+    board = _remote_board(git_repo.parent, gh, cache=tmp_path / "remote.json")
+    assert board.read_remote(force=True) is True
+
+    assert cmd_busy(board, 86400.0, now=_now()) == 0
+    assert cmd_busy(board, 30.0, now=_now() + 86400 * 30) == 1
+
+
+def test_busy_takes_the_two_remote_flags() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["busy", "--remote"]).remote is True
+    assert parser.parse_args(["busy", "--refresh"]).refresh is True

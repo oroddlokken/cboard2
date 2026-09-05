@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -264,3 +265,68 @@ def test_a_branch_tip_that_is_not_a_sha_is_dropped(tmp_path: Path) -> None:
 
     assert loaded is not None
     assert loaded.branches == {"acme/one": {"spike": SHA}}
+
+
+def test_a_file_from_the_previous_version_is_discarded(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": VERSION - 1,
+                "read_at": READ_AT,
+                "prs_known": True,
+                "repos": {"acme/one": {"default_branch": "main", "default_sha": SHA}},
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    assert load(target) is None
+
+
+def test_both_pr_lists_and_their_checks_survive_a_round_trip(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    cached = Cached(
+        read_at=READ_AT,
+        defaults={"acme/one": ("main", SHA)},
+        prs={"acme/one": (replace(_pr(4), checks="failing"),)},
+        prs_known=True,
+        review_prs={"acme/one": (_pr(9),)},
+        review_prs_known=True,
+    )
+
+    assert save(target, cached) is True
+    read = load(target)
+
+    assert read is not None
+    assert read.prs["acme/one"][0].checks == "failing"
+    assert [pr.number for pr in read.review_prs["acme/one"]] == [9]
+    assert read.review_prs_known is True
+
+
+def test_a_stored_pr_without_a_checks_field_reads_as_unknown(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": VERSION,
+                "read_at": READ_AT,
+                "prs_known": True,
+                "repos": {
+                    "acme/one": {
+                        "default_branch": "main",
+                        "default_sha": SHA,
+                        "prs": [{"number": 4}],
+                    },
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    read = load(target)
+
+    assert read is not None
+    assert read.prs["acme/one"][0].checks == "unknown"
+    assert read.review_prs == {}
+    assert read.review_prs_known is False

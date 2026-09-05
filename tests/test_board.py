@@ -124,7 +124,7 @@ def test_read_remote_walks_the_roots_before_its_first_read(tmp_path: Path) -> No
     assert board.read_remote(now=START) is True
 
     assert [repo.name for repo in board.repos] == ["alpha", "beta"]
-    assert [args[0] for args in gh.calls] == ["api", "search"]
+    assert [args[0] for args in gh.calls] == ["search", "search", "api"]
 
 
 def test_a_worktree_row_follows_the_repo_it_belongs_to(

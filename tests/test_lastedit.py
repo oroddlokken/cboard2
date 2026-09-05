@@ -118,7 +118,8 @@ def test_parses_every_path_shape_and_unquotes() -> None:
         "untracked æøå.txt",
     )
     assert snap.staged == 1
-    assert snap.unstaged == 3
+    assert snap.unstaged == 2
+    assert snap.unmerged == 1
     assert snap.untracked == 1
 
 

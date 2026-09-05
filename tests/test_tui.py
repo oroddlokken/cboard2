@@ -24,6 +24,7 @@ from cboard2.tui import (
     CboardApp,
     DetailScreen,
     Fold,
+    NameFilter,
     _paint,
     active_text,
     cap_worktrees,
@@ -37,6 +38,7 @@ from cboard2.tui import (
     remote_text,
     row_cells,
     sort_rows,
+    state_text,
 )
 
 if TYPE_CHECKING:
@@ -1433,3 +1435,264 @@ async def test_shift_d_on_the_fold_row_writes_nothing(tmp_path: Path) -> None:
 
     assert not config_file.exists()
     assert app._board.config.dormant == ()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_slash_opens_the_name_filter_and_typing_narrows_the_table(
+    tmp_path: Path,
+) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("keyforge"), _row("cboard2"), _row("notes")])
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await pilot.pause()
+        entry = app.query_one(NameFilter)
+
+        assert entry.has_class("open")
+        assert app.focused is entry
+
+        await pilot.press("f", "o", "r")
+        await pilot.pause()
+
+        assert _keys(app) == [str(Path("/tmp/keyforge"))]  # noqa: S108
+
+
+@pytest.mark.asyncio
+async def test_the_name_filter_matches_without_regard_to_case(tmp_path: Path) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("KeyForge"), _row("notes")])
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await pilot.press("k", "e", "y")
+        await pilot.pause()
+
+        assert _keys(app) == [str(Path("/tmp/KeyForge"))]  # noqa: S108
+
+
+@pytest.mark.asyncio
+async def test_a_name_filter_matching_nothing_empties_the_table(
+    tmp_path: Path,
+) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("keyforge"), _row("notes")])
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await pilot.press("z", "z", "z")
+        await pilot.pause()
+
+        assert _keys(app) == []
+        assert _table(app).row_count == 0
+
+
+@pytest.mark.asyncio
+async def test_the_name_filter_composes_with_the_dirty_toggle(tmp_path: Path) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(
+            [
+                _row("keyforge", dirty=2),
+                _row("keyforge-docs"),
+                _row("notes", dirty=1),
+            ],
+        )
+        await pilot.pause()
+
+        await pilot.press("d")
+        await pilot.press("slash")
+        await pilot.press("k", "e", "y")
+        await pilot.pause()
+
+        assert _keys(app) == [str(Path("/tmp/keyforge"))]  # noqa: S108
+        assert "name ~ key" in app.sub_title
+
+
+@pytest.mark.asyncio
+async def test_escape_clears_the_name_filter_and_restores_every_row(
+    tmp_path: Path,
+) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("keyforge"), _row("cboard2"), _row("notes")])
+        await pilot.pause()
+
+        await pilot.press("slash")
+        await pilot.press("k", "e", "y")
+        await pilot.pause()
+        assert len(_keys(app)) == 1
+
+        await pilot.press("escape")
+        await pilot.pause()
+        entry = app.query_one(NameFilter)
+
+        assert entry.value == ""
+        assert not entry.has_class("open")
+        assert len(_keys(app)) == 3
+        assert app.focused is _table(app)
+
+
+@pytest.mark.asyncio
+async def test_the_name_filter_keeps_the_selected_row_selected(tmp_path: Path) -> None:
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("keyforge"), _row("keyforge-docs"), _row("notes")])
+        await pilot.pause()
+        _table(app).move_cursor(row=1)
+
+        await pilot.press("slash")
+        await pilot.press("k", "e", "y")
+        await pilot.pause()
+
+        assert cursor_key(_table(app)) == str(Path("/tmp/keyforge-docs"))  # noqa: S108
+
+
+def test_a_worktree_matches_the_name_of_the_repo_it_belongs_to(
+    tmp_path: Path,
+) -> None:
+    repo = _row("keyforge")
+    tree = _row("fix", main_git_dir=tmp_path / "keyforge" / ".git")
+
+    assert filter_rows([repo, tree], name="keyforge") == [repo, tree]
+    assert filter_rows([repo, tree], name="fix") == [tree]
+
+
+def _state_row(
+    *,
+    operation: str = "none",
+    unmerged: int = 0,
+    unstaged: int = 0,
+    stashed: int = 0,
+) -> Row:
+    """Build a row carrying the working-tree fields the State column reads."""
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=0.0,
+        branch="main",
+        operation=operation,
+        unmerged=unmerged,
+        unstaged=unstaged,
+        stashed=stashed,
+    )
+    return Row(state=state, moved_at=0.0)
+
+
+def test_the_state_cell_reds_a_repo_stopped_mid_rebase() -> None:
+    cell = state_text(_state_row(operation="rebase", unmerged=2, unstaged=1))
+
+    assert cell.plain == "rebase U2 M1"
+    assert str(cell.style) == "red"
+
+
+def test_the_state_cell_yellows_ordinary_dirt_and_dims_a_lone_stash() -> None:
+    dirty = state_text(_state_row(unstaged=2))
+    stashed = state_text(_state_row(stashed=1))
+
+    assert (dirty.plain, str(dirty.style)) == ("M2", "yellow")
+    assert (stashed.plain, str(stashed.style)) == ("stash 1", "dim")
+    assert state_text(_state_row()).plain == "clean"
+
+
+def test_the_detail_screen_reports_the_halted_operation_and_the_stash(
+    tmp_path: Path,
+) -> None:
+    screen = DetailScreen(
+        _state_row(operation="cherry-pick", unmerged=1, stashed=2),
+        _board(tmp_path),
+        clock=lambda: 0.0,
+    )
+
+    text = screen.working_content().plain
+
+    assert "cherry-pick in progress, unfinished" in text
+    assert "1 conflicted path" in text
+    assert "2 stashes" in text
+    assert (
+        "nothing halted"
+        in DetailScreen(
+            _state_row(),
+            _board(tmp_path),
+            clock=lambda: 0.0,
+        )
+        .working_content()
+        .plain
+    )
+
+
+def test_the_pr_cell_counts_the_review_queue_beside_the_users_own() -> None:
+    state = RemoteState(
+        prs_known=True,
+        prs=(replace(_pr(3), checks="passing"),),
+        review_prs_known=True,
+        review_prs=(_pr(8), _pr(9)),
+    )
+
+    cell = pr_text(_row("repo", remote=state))
+
+    assert cell.plain == "1 ✓  2 to review"
+    assert str(cell.style) == "cyan"
+
+
+def test_the_pr_cell_reds_a_failing_check_of_the_users_own() -> None:
+    state = RemoteState(
+        prs_known=True,
+        prs=(replace(_pr(3), checks="failing"),),
+        review_prs_known=True,
+    )
+
+    cell = pr_text(_row("repo", remote=state))
+
+    assert cell.plain == "1 ✗"
+    assert str(cell.style) == "red"
+
+
+def test_the_pr_cell_stays_unknown_until_a_search_answers() -> None:
+    assert pr_text(_row("repo")).plain == "?"
+    assert (
+        pr_text(
+            _row("repo", remote=RemoteState(prs_known=True, review_prs_known=True)),
+        ).plain
+        == "—"
+    )
+
+
+def test_the_detail_screen_lists_the_prs_awaiting_review(tmp_path: Path) -> None:
+    state = RemoteState(
+        prs_known=True,
+        review_prs_known=True,
+        review_prs=(replace(_pr(12), checks="failing"),),
+    )
+    screen = DetailScreen(
+        _row("repo", remote=state), _board(tmp_path), clock=lambda: 0.0
+    )
+
+    text = screen.review_content(0.0).plain
+
+    assert "#12" in text
+    assert "✗ failing" in text
+    assert screen.prs_content(0.0).plain == "none open"
+
+
+def test_an_unread_review_search_says_so(tmp_path: Path) -> None:
+    screen = DetailScreen(_row("repo"), _board(tmp_path), clock=lambda: 0.0)
+
+    assert screen.review_content(0.0).plain == "not read"

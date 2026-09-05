@@ -4,9 +4,10 @@ The shape it carries is :class:`cboard2.remote.Cached`.
 
 Only what the network told us is stored, keyed by ``owner/name`` on GitHub and
 by the origin URL elsewhere: the default branch and its tip, the tip of each
-branch the read asked about by name, and the user's open pull requests. The two
-behind markers are deliberately absent — they are derived from the local refs,
-so a cached copy would keep reporting ``behind main`` after a pull.
+branch the read asked about by name, and the pull requests the user authored or
+was asked to review with each one's checks state. The two behind markers are
+deliberately absent — they are derived from the local refs, so a cached copy
+would keep reporting ``behind main`` after a pull.
 :meth:`cboard2.remote.RemoteReader.refresh_local` recomputes them on load.
 
 The key is the remote rather than the repo path because that is what the answer
@@ -22,7 +23,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from cboard2.remote import Cached, PullRequest
+from cboard2.remote import CHECKS_UNKNOWN, Cached, PullRequest
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -30,8 +31,12 @@ if TYPE_CHECKING:
 _ENV_CACHE_PATH = "CBOARD2_CACHE"
 """Env var pointing at an alternate cache file, for tests and power users."""
 
-VERSION = 2
-"""Schema version. A file written by another version is read as a cold cache."""
+VERSION = 3
+"""Schema version. A file written by another version is read as a cold cache.
+
+Bumped whenever a stored field is added or changes meaning, so a file from an
+older cboard2 is discarded rather than half-read.
+"""
 
 
 def cache_path() -> Path:
@@ -76,6 +81,7 @@ def load(path: Path) -> Cached | None:
     defaults: dict[str, tuple[str, str]] = {}
     branches: dict[str, Mapping[str, str]] = {}
     prs: dict[str, tuple[PullRequest, ...]] = {}
+    review: dict[str, tuple[PullRequest, ...]] = {}
     for key, entry in _as_dict(body.get("repos")).items():
         fields = _as_dict(entry)
         branch = fields.get("default_branch")
@@ -88,6 +94,9 @@ def load(path: Path) -> Cached | None:
         found = _requests(fields.get("prs"))
         if found:
             prs[key] = found
+        awaiting = _requests(fields.get("review_prs"))
+        if awaiting:
+            review[key] = awaiting
 
     return Cached(
         read_at=float(read_at),
@@ -95,6 +104,8 @@ def load(path: Path) -> Cached | None:
         branches=branches,
         prs=prs,
         prs_known=body.get("prs_known") is True,
+        review_prs=review,
+        review_prs_known=body.get("review_prs_known") is True,
     )
 
 
@@ -111,10 +122,14 @@ def save(path: Path, cached: Cached) -> bool:
         "version": VERSION,
         "read_at": cached.read_at,
         "prs_known": cached.prs_known,
+        "review_prs_known": cached.review_prs_known,
         "repos": {
             key: _entry(cached, key)
             for key in sorted(
-                set(cached.defaults) | set(cached.branches) | set(cached.prs),
+                set(cached.defaults)
+                | set(cached.branches)
+                | set(cached.prs)
+                | set(cached.review_prs),
             )
         },
     }
@@ -148,16 +163,20 @@ def _entry(cached: Cached, key: str) -> dict[str, object]:
         "default_branch": branch,
         "default_sha": sha,
         "branches": dict(cached.branches.get(key, {})),
-        "prs": [
-            {
-                "number": pr.number,
-                "title": pr.title,
-                "url": pr.url,
-                "draft": pr.draft,
-                "updated_at": pr.updated_at,
-            }
-            for pr in cached.prs.get(key, ())
-        ],
+        "prs": [_stored(pr) for pr in cached.prs.get(key, ())],
+        "review_prs": [_stored(pr) for pr in cached.review_prs.get(key, ())],
+    }
+
+
+def _stored(pr: PullRequest) -> dict[str, object]:
+    """Return one pull request as the fields the file carries."""
+    return {
+        "number": pr.number,
+        "title": pr.title,
+        "url": pr.url,
+        "draft": pr.draft,
+        "updated_at": pr.updated_at,
+        "checks": pr.checks,
     }
 
 
@@ -181,6 +200,7 @@ def _requests(value: object) -> tuple[PullRequest, ...]:
         if not isinstance(number, int) or isinstance(number, bool):
             continue
         updated = fields.get("updated_at")
+        checks = fields.get("checks")
         found.append(
             PullRequest(
                 number=number,
@@ -190,6 +210,7 @@ def _requests(value: object) -> tuple[PullRequest, ...]:
                 updated_at=float(updated)
                 if isinstance(updated, (int, float)) and not isinstance(updated, bool)
                 else None,
+                checks=checks if isinstance(checks, str) else CHECKS_UNKNOWN,
             ),
         )
     return tuple(found)

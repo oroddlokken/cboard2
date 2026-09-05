@@ -25,7 +25,7 @@ from textual.containers import VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Footer, Header, Input, Static
 from textual.widgets.data_table import CellDoesNotExist, RowDoesNotExist
 
 from cboard2.activity import branches
@@ -33,8 +33,15 @@ from cboard2.board import group_families
 from cboard2.config import config_path
 from cboard2.configwrite import toggled, write_dormant
 from cboard2.discovery import main_name
+from cboard2.gitstate import NO_OPERATION, state_parts
 from cboard2.pull import pull_default
-from cboard2.remote import ORIGIN, origin_key
+from cboard2.remote import (
+    CHECKS_FAILING,
+    ORIGIN,
+    checks_mark,
+    origin_key,
+    worst_checks,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Container, Iterable, Sequence
@@ -158,14 +165,22 @@ def _most_recent(rows: Sequence[Row], limit: int) -> list[Row]:
 def filter_rows(
     rows: Sequence[Row],
     *,
+    name: str = "",
     dirty_only: bool = False,
     unpushed_only: bool = False,
     behind_only: bool = False,
     prs_only: bool = False,
     since: float | None = None,
 ) -> list[Row]:
-    """Keep the rows matching every active filter."""
+    """Keep the rows matching every active filter.
+
+    ``name`` is matched case-insensitively against the row's full label, so a
+    worktree is reachable by its own directory and by the repo it belongs to.
+    """
     kept = list(rows)
+    if name:
+        needle = name.casefold()
+        kept = [row for row in kept if needle in row.state.label.casefold()]
     if dirty_only:
         kept = [row for row in kept if row.state.dirty]
     if unpushed_only:
@@ -243,20 +258,18 @@ def head_text(row: Row) -> Text:
 
 
 def state_text(row: Row) -> Text:
-    """Render the dirty counts, or ``clean``."""
+    """Render the halted operation, the dirty counts and the stash depth.
+
+    Red for a repo that has stopped mid-operation or holds a conflict: that
+    one has to be finished before anything else in it can move.
+    """
     state = row.state
-    if state.dirty == 0:
+    parts = state_parts(state)
+    if not parts:
         return Text("clean", style="dim")
-    parts = [
-        f"{prefix}{count}"
-        for prefix, count in (
-            ("S", state.staged),
-            ("M", state.unstaged),
-            ("?", state.untracked),
-        )
-        if count
-    ]
-    return Text(" ".join(parts), style="yellow")
+    if state.halted:
+        return Text(" ".join(parts), style="red")
+    return Text(" ".join(parts), style="yellow" if state.dirty else "dim")
 
 
 def ahead_behind_text(row: Row) -> Text:
@@ -327,17 +340,38 @@ def remote_text(row: Row) -> Text:
 
 
 def pr_text(row: Row) -> Text:
-    """Render the count of the user's open PRs, and how many are drafts."""
+    """Render the user's own open PRs and how many wait on their review.
+
+    Red when one of their own PRs is failing its checks, which is the state in
+    this cell they have to act on themselves.
+    """
     remote = row.remote
-    if not remote.prs_known:
+    if not (remote.prs_known or remote.review_prs_known):
         return Text("?", style="dim")
-    if not remote.prs:
+    parts = [part for part in (own_pr_text(row), review_pr_text(row)) if part]
+    if not parts:
         return Text("—", style="dim")
-    drafts = remote.draft_count
+    failing = worst_checks(remote.prs) == CHECKS_FAILING
+    return Text("  ".join(parts), style="red" if failing else "cyan")
+
+
+def own_pr_text(row: Row) -> str:
+    """Return the user's open PR count, its drafts and its worst checks state."""
+    remote = row.remote
+    if not remote.prs:
+        return ""
     label = str(len(remote.prs))
+    drafts = remote.draft_count
     if drafts:
         label += f" ({drafts} draft{'s' if drafts > 1 else ''})"
-    return Text(label, style="cyan")
+    mark = checks_mark(worst_checks(remote.prs))
+    return f"{label} {mark}" if mark else label
+
+
+def review_pr_text(row: Row) -> str:
+    """Return how many PRs are waiting on the user's review here."""
+    count = len(row.remote.review_prs)
+    return f"{count} to review" if count else ""
 
 
 def pr_content(pr: PullRequest, now: float) -> Content:
@@ -355,6 +389,14 @@ def pr_content(pr: PullRequest, now: float) -> Content:
     parts: list[str | tuple[str, str]] = [
         (heading, f"link='{pr.url}'") if _linkable(pr.url) else heading,
     ]
+    mark = checks_mark(pr.checks)
+    if mark:
+        parts.append(
+            (
+                f"  {mark} {pr.checks}",
+                "red" if pr.checks == CHECKS_FAILING else "dim",
+            ),
+        )
     if pr.draft:
         parts.append(("  draft", "magenta"))
     age = "" if pr.updated_at is None else relative(now - pr.updated_at)
@@ -476,6 +518,19 @@ def restore_cursor(table: DataTable[str | Text], key: str | None) -> None:
     table.move_cursor(row=index, scroll=False)
 
 
+class NameFilter(Input):
+    """The one-line repo-name filter that ``/`` opens above the table."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "close_filter", "Clear filter", show=False),
+    ]
+
+    def action_close_filter(self) -> None:
+        """Clear the text and hand the keyboard back to the table."""
+        app = cast("CboardApp", self.app)  # pyright: ignore[reportUnknownMemberType]
+        app.close_filter()
+
+
 class DetailScreen(ModalScreen[None]):
     """One repo up close: its changed files, branches and HEAD movements."""
 
@@ -529,6 +584,10 @@ class DetailScreen(ModalScreen[None]):
             yield Static(self.remote_content())
             yield Static("My open pull requests", classes="detail-heading")
             yield Static(self.prs_content(now))
+            yield Static("Awaiting my review", classes="detail-heading")
+            yield Static(self.review_content(now))
+            yield Static("Working tree", classes="detail-heading")
+            yield Static(self.working_content())
             yield Static("Changed files", classes="detail-heading")
             yield Static(self.files_content())
             yield Static("Branches", classes="detail-heading")
@@ -590,6 +649,35 @@ class DetailScreen(ModalScreen[None]):
         if not remote.prs:
             return Content.styled("none open", "dim")
         return _joined(pr_content(pr, now) for pr in remote.prs)
+
+    def review_content(self, now: float) -> Content:
+        """Return the PRs on this repo that have asked the user for a review."""
+        remote = self._row.remote
+        if not remote.review_prs_known:
+            return Content.styled("not read", "dim")
+        if not remote.review_prs:
+            return Content.styled("none", "dim")
+        return _joined(pr_content(pr, now) for pr in remote.review_prs)
+
+    def working_content(self) -> Content:
+        """Return the halted operation, the conflict count and the stash depth."""
+        state = self._row.state
+        lines: list[Content] = []
+        if state.operation != NO_OPERATION:
+            lines.append(
+                Content.styled(f"{state.operation} in progress, unfinished", "red"),
+            )
+        if state.unmerged:
+            plural = "" if state.unmerged == 1 else "s"
+            lines.append(
+                Content.styled(f"{state.unmerged} conflicted path{plural}", "red"),
+            )
+        if state.stashed:
+            plural = "" if state.stashed == 1 else "es"
+            lines.append(Content.styled(f"{state.stashed} stash{plural}", "yellow"))
+        if not lines:
+            return Content.styled("nothing halted, nothing stashed", "dim")
+        return _joined(lines)
 
     def files_content(self) -> Content:
         """Return the dirty paths, capped, or a note that the tree is clean."""
@@ -697,13 +785,27 @@ class CboardApp(App[None]):
 
     TITLE = "cboard2"
 
+    AUTO_FOCUS = "DataTable"
+    """The table takes the keyboard at startup.
+
+    Textual's default focuses the first focusable widget, which is the name
+    filter — every binding would then be typed into it instead of firing.
+    """
+
     CSS = """
     DataTable {
         height: 1fr;
     }
+    NameFilter {
+        display: none;
+    }
+    NameFilter.open {
+        display: block;
+    }
     """
     """Without a height the table stops at its last row, leaving its own
-    horizontal scrollbar stranded mid-screen above the footer."""
+    horizontal scrollbar stranded mid-screen above the footer. The filter is
+    laid out above the table and takes its row only while ``/`` has opened it."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit"),
@@ -712,6 +814,7 @@ class CboardApp(App[None]):
         Binding("u", "toggle_unpushed", "Unpushed only"),
         Binding("b", "toggle_behind", "Behind remote"),
         Binding("p", "toggle_prs", "Open PRs"),
+        Binding("slash", "open_filter", "Filter by name"),
         Binding("P", "pull_default", "Pull default"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("t", "cycle_window", "Window"),
@@ -734,6 +837,7 @@ class CboardApp(App[None]):
         self._clock = clock
         self._config_file = config_file or config_path()
         self._rows: list[Row] = []
+        self._name_filter = ""
         self._dirty_only = False
         self._unpushed_only = False
         self._behind_only = False
@@ -747,8 +851,9 @@ class CboardApp(App[None]):
         self._expanded: set[Path] = set()
 
     def compose(self) -> ComposeResult:
-        """Lay out the header, repo table and footer."""
+        """Lay out the header, name filter, repo table and footer."""
         yield Header()
+        yield NameFilter(placeholder="repo name…", id="name-filter")
         yield DataTable[str | Text](zebra_stripes=True)
         yield Footer()
 
@@ -798,6 +903,7 @@ class CboardApp(App[None]):
         return sort_rows(
             filter_rows(
                 self._rows,
+                name=self._name_filter,
                 dirty_only=self._dirty_only,
                 unpushed_only=self._unpushed_only,
                 behind_only=self._behind_only,
@@ -894,6 +1000,8 @@ class CboardApp(App[None]):
         ]
         if active:
             parts.append(f"{' + '.join(active)} only")
+        if self._name_filter:
+            parts.append(f"name ~ {self._name_filter}")
         if label != "all":
             parts.append(f"active <{label}")
         if folded:
@@ -924,6 +1032,43 @@ class CboardApp(App[None]):
     def action_toggle_prs(self) -> None:
         """Show only repos where the user has an open pull request."""
         self._prs_only = not self._prs_only
+        self._reorder = True
+        self.render_rows()
+
+    def action_open_filter(self) -> None:
+        """Open the name filter and put the cursor in it."""
+        try:
+            entry = self.query_one(NameFilter)
+        except NoMatches:
+            return
+        entry.add_class("open")
+        entry.focus()
+
+    def close_filter(self) -> None:
+        """Hide the name filter, drop its text and focus the table again.
+
+        Bound to escape inside the input. The rows it was hiding come back on
+        the repaint, and the cursor lands on whichever of them it was on.
+        """
+        try:
+            entry = self.query_one(NameFilter)
+        except NoMatches:
+            return
+        entry.remove_class("open")
+        entry.value = ""
+        self._name_filter = ""
+        self._reorder = True
+        self.render_rows()
+        try:
+            self.query_one(DataTable).focus()
+        except NoMatches:
+            return
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Narrow the table as the filter text is typed."""
+        if event.input.id != "name-filter":
+            return
+        self._name_filter = event.value
         self._reorder = True
         self.render_rows()
 

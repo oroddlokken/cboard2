@@ -4,6 +4,9 @@ Two calls per repo — one ``status --porcelain=v2 --branch`` and one ``log -1``
 — run across a thread pool. Measured on the author's machine: 94 repos in 0.28s
 at 16 workers, against 1.4s serially.
 
+A halted merge or rebase and the stash depth come from the git directory
+instead of a third call: both are a marker file whose presence is the answer.
+
 A repo the config marks dormant is held back to its long interval instead of
 being polled every tick, so a shelf of archived clones costs nothing per
 second. :meth:`Poller.poll` with ``force=True`` ignores that window.
@@ -17,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from cboard2.discovery import main_name
+from cboard2.discovery import git_dir, main_name
 from cboard2.lastedit import newest_mtime
 
 if TYPE_CHECKING:
@@ -39,6 +42,31 @@ _HEAD_ARGS = ("log", "-1", "--format=%s%x09%ct")
 
 _PATH_FIELD_INDEX = {"1": 8, "2": 9, "u": 10}
 """Field index of the path on each kind of porcelain-v2 entry line."""
+
+NO_OPERATION = "none"
+"""The value :attr:`RepoState.operation` takes when nothing is halted."""
+
+_OPERATION_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("rebase", ("rebase-merge", "rebase-apply")),
+    ("merge", ("MERGE_HEAD",)),
+    ("cherry-pick", ("CHERRY_PICK_HEAD",)),
+    ("revert", ("REVERT_HEAD",)),
+    ("bisect", ("BISECT_LOG",)),
+)
+"""Entries git leaves in the git directory while an operation waits on the user.
+
+Checked in the order git resolves them: a rebase that stopped on a conflict
+also has a ``MERGE_HEAD``, and rebase is the operation the user has to finish.
+"""
+
+_STASH_LOG = "logs/refs/stash"
+_STASH_REF = "refs/stash"
+"""Where the stash depth is read from, without running ``git stash list``.
+
+The reflog has one line per entry and is rewritten on a drop, so its line count
+is the depth. A repo whose reflog is missing falls back to whether the ref
+exists at all, which is worth one line of report rather than none.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +90,15 @@ class RepoState:
     staged: int = 0
     unstaged: int = 0
     untracked: int = 0
+    unmerged: int = 0
+    """Paths git reports as conflicted, counted apart from the ordinary edits."""
+
+    operation: str = NO_OPERATION
+    """The halted operation: merge, rebase, cherry-pick, revert, bisect or none."""
+
+    stashed: int = 0
+    """Entries on the stash, shared with this repo's linked worktrees."""
+
     ahead: int = 0
     behind: int = 0
     upstream: str | None = None
@@ -73,8 +110,13 @@ class RepoState:
 
     @property
     def dirty(self) -> int:
-        """Total changed entries: staged, unstaged and untracked together."""
-        return self.staged + self.unstaged + self.untracked
+        """Total changed entries: staged, unstaged, untracked and conflicted."""
+        return self.staged + self.unstaged + self.untracked + self.unmerged
+
+    @property
+    def halted(self) -> bool:
+        """Whether an operation or a conflict is waiting on the user here."""
+        return self.operation != NO_OPERATION or self.unmerged > 0
 
     @property
     def label(self) -> str:
@@ -117,6 +159,7 @@ class Snapshot:
     staged: int
     unstaged: int
     untracked: int
+    unmerged: int
     dirty_paths: tuple[str, ...]
 
 
@@ -216,6 +259,9 @@ class Poller:
             snap = parse_porcelain_v2(status)
             subject, head_time = self._head_meta(repo.path)
             edit = newest_mtime(repo.path, snap.dirty_paths)
+            own = git_dir(repo.path)
+            operation = read_operation(own)
+            stashed = count_stashes(repo.main_git_dir or own)
         except (OSError, ValueError):
             return _unreadable(repo, moment)
 
@@ -233,6 +279,9 @@ class Poller:
             staged=snap.staged,
             unstaged=snap.unstaged,
             untracked=snap.untracked,
+            unmerged=snap.unmerged,
+            operation=operation,
+            stashed=stashed,
             ahead=snap.ahead,
             behind=snap.behind,
             upstream=snap.upstream,
@@ -286,7 +335,7 @@ def parse_porcelain_v2(text: str) -> Snapshot:
     detached = False
     head_sha: str | None = None
     upstream: str | None = None
-    ahead = behind = staged = unstaged = untracked = 0
+    ahead = behind = staged = unstaged = untracked = unmerged = 0
     dirty_paths: list[str] = []
 
     for line in text.splitlines():
@@ -309,7 +358,7 @@ def parse_porcelain_v2(text: str) -> Snapshot:
             unstaged += int(len(xy) > 1 and xy[1] != ".")
             dirty_paths.append(_entry_path(line))
         elif line.startswith("u "):
-            unstaged += 1  # an unmerged conflict is work in the tree
+            unmerged += 1
             dirty_paths.append(_entry_path(line))
         elif line.startswith("? "):
             untracked += 1
@@ -325,8 +374,58 @@ def parse_porcelain_v2(text: str) -> Snapshot:
         staged=staged,
         unstaged=unstaged,
         untracked=untracked,
+        unmerged=unmerged,
         dirty_paths=tuple(dirty_paths),
     )
+
+
+def read_operation(git_directory: Path) -> str:
+    """Return the operation halted in ``git_directory``, or :data:`NO_OPERATION`.
+
+    A handful of ``exists`` calls rather than a git call, because this runs per
+    repo on the 2s poll and a subprocess there would cost more than the whole
+    status read.
+    """
+    for name, markers in _OPERATION_MARKERS:
+        if any((git_directory / marker).exists() for marker in markers):
+            return name
+    return NO_OPERATION
+
+
+def count_stashes(git_directory: Path) -> int:
+    """Return how many entries are on the stash, read from its reflog.
+
+    A worktree shares the stash with the repo it belongs to, so the caller
+    passes the common git directory rather than the worktree's own.
+    """
+    try:
+        log = (git_directory / _STASH_LOG).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return int((git_directory / _STASH_REF).exists())
+    return sum(1 for line in log.splitlines() if line.strip())
+
+
+def state_parts(state: RepoState) -> list[str]:
+    """Return the state cell's parts, in the order they need attention.
+
+    The halted operation leads: a repo stopped mid-rebase has to be finished
+    before the size of its diff is worth reading. The stash trails, because it
+    is work the user put down on purpose.
+    """
+    parts = [] if state.operation == NO_OPERATION else [state.operation]
+    parts += [
+        f"{prefix}{count}"
+        for prefix, count in (
+            ("U", state.unmerged),
+            ("S", state.staged),
+            ("M", state.unstaged),
+            ("?", state.untracked),
+        )
+        if count
+    ]
+    if state.stashed:
+        parts.append(f"stash {state.stashed}")
+    return parts
 
 
 def _entry_path(line: str) -> str:
