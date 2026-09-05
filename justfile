@@ -44,3 +44,25 @@ test-changed:
 # run all tests with coverage
 test-all:
     COVERAGE_CORE=sysmon uv run pytest --timeout 60 -n 8 tests --cov-report=html --cov=src/cboard2
+
+# show next possible versions (patch or minor bump)
+next:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//; s/-rc\..*//' | sort -t. -k1,1n -k2,2n -k3,3n -u | tail -1)
+    LATEST=${LATEST:-0.0.0}
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST"
+    RC=$(git tag -l "v${LATEST}-rc.*" | sort -V | tail -1 | sed -n 's/.*-rc\.//p')
+    RELEASED=$(git tag -l "v${LATEST}" | head -1)
+    if [ -n "$RC" ] && [ -z "$RELEASED" ]; then
+        echo "Current: ${LATEST} (rc.${RC}, unreleased)"
+    else
+        echo "Current: ${LATEST}"
+    fi
+    echo "  patch: ${MAJOR}.${MINOR}.$((PATCH + 1))"
+    echo "  minor: ${MAJOR}.$((MINOR + 1)).0"
+
+# prepare a release: create RC tag, push branch, open PR
+release-prep *args:
+    ./scripts/release-prep {{args}}
+    git pull origin main

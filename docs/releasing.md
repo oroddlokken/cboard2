@@ -1,0 +1,51 @@
+# Releasing
+
+Releasing is the user's call. Read this before running anything in it.
+
+## `just release-prep` is irreversible past the PR merge
+
+`just release-prep <version>` runs `just lint-all` and `just test-all`, stamps `CHANGELOG.md`,
+resets an existing `release/v<version>` branch to `main`, force-pushes it with lease, pushes a
+`vX.Y.Z-rc.N` tag, and opens a pull request.
+
+The branch work happens in this clone rather than in a worktree. The tree has to be clean, and
+the script checks out `release/v<version>` and returns you to the branch you started on.
+
+An existing branch counts whether or not this clone has it. A remote-only branch is fetched,
+because branching off `main` instead forks a sibling commit no push can fast-forward.
+
+The tag goes out only after the branch push lands, and a rejected push deletes the local tag and
+stops. `tests/test_release_prep.py` drives both paths against a bare local remote.
+
+Merging that pull request fires `.github/workflows/publish.yml`. It tags `vX.Y.Z`, builds the
+wheel and sdist, creates the GitHub release, and pushes a formula commit to the
+`oroddlokken/homebrew-tap` repo. The merge is the irreversible step, and it is the user's to make.
+
+Run `just release-prep` only when the user names a version and asks for a release, and leave the
+merge to them. `just next` reports the candidate patch and minor versions and changes nothing.
+
+The branch name is load-bearing. `publish.yml` fires only for a merged pull request whose head
+branch starts with `release/v`; landing the same commits any other way publishes nothing.
+
+`publish.yml` and `ci.yml` both run `just lint-all` and `just test-all`, and each sets up its own
+toolchain. A step added to one has to be added to the other, or the failure surfaces at release
+time, when the merge has already landed on `main`.
+
+## Homebrew formula
+
+`publish.yml` rewrites the `url` and `sha256` fields in `Formula/cboard2.rb` in the tap repo and
+pushes the commit, so a version bump needs no hand edit and a hand edit is overwritten by the next
+release.
+
+Hand edits cover structural changes only: a new runtime dependency, a changed entry point. Wait for
+user confirmation before making one, and say so when a CLI change requires it.
+
+The formula file keeps the distribution's name while the binary is `cboard`, so
+`brew install oroddlokken/tap/cboard2` puts `cboard` on PATH.
+
+The tap is a separate repo with no checkout under `~/git`. Clone it before editing rather than
+assuming a nearby directory is it.
+
+The `update-homebrew` job reads `HOMEBREW_TAP_TOKEN` from this repo's secrets — a PAT with
+`contents:write` on the tap. Without it the job fails at the tap checkout, after the tag and the
+GitHub release have already gone out.

@@ -15,8 +15,17 @@ the rest still works.
 ## Install
 
 ```bash
+brew install oroddlokken/tap/cboard2
+cboard
+```
+
+The formula keeps the project's name; the command it installs is `cboard`.
+
+From a checkout:
+
+```bash
 uv tool install .
-cboard2
+cboard
 ```
 
 ## The dashboard
@@ -54,11 +63,11 @@ work still sorts you to the top.
 ## Scripting
 
 ```bash
-cboard2 ls                  # the table, as plain columns
-cboard2 ls --remote         # add the remote columns, served from the cache
-cboard2 json --since 2h     # the same rows as JSON
-cboard2 busy --since 5m     # exit 0 if anything moved in the last 5 minutes
-cboard2 busy --remote       # exit 0 if anything is behind or has a PR too
+cboard ls                  # the table, as plain columns
+cboard ls --remote         # add the remote columns, served from the cache
+cboard json --since 2h     # the same rows as JSON
+cboard busy --since 5m     # exit 0 if anything moved in the last 5 minutes
+cboard busy --remote       # exit 0 if anything is behind or has a PR too
 ```
 
 `busy` is meant for a tmux statusline or a shell guard. `--since` takes `30s`,

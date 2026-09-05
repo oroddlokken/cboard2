@@ -44,7 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config()
     except ConfigError as exc:
-        sys.stderr.write(f"cboard2: {exc}\n")
+        sys.stderr.write(f"cboard: {exc}\n")
         return 2
 
     if args.command is None:
@@ -75,9 +75,9 @@ def duration(text: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Return the argument parser. A bare ``cboard2`` opens the dashboard."""
+    """Return the argument parser. A bare ``cboard`` opens the dashboard."""
     parser = argparse.ArgumentParser(
-        prog="cboard2",
+        prog="cboard",
         description="Report the git state of every repo under the configured roots.",
     )
     sub = parser.add_subparsers(dest="command")

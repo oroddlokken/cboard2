@@ -1,0 +1,139 @@
+name: Publish Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    # The branch name is the version source, so commits landed any other way
+    # publish nothing.
+    if: github.event.pull_request.merged == true && startsWith(github.head_ref, 'release/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: "3.13"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3  # v4.0.0
+
+      - run: uv sync --group dev
+
+      # Both checks run ahead of the tag push, which is the first irreversible
+      # step: a failure after it would leave vX.Y.Z on origin with no release.
+      - run: just lint-all
+
+      - run: just test-all
+
+      - name: Extract version from branch name
+        id: version
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          VERSION="${BRANCH#release/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # hatch-vcs reads the version out of the tag pushed above, so this step
+      # cannot move ahead of it.
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BODY=$(awk -v ver="$VERSION" '
+            /^## / {
+              if (found) exit
+              if ($0 ~ ver) found=1; next
+            }
+            found { print }
+          ' CHANGELOG.md)
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "cboard2 ${{ steps.version.outputs.version }}"
+          body: ${{ steps.changelog.outputs.body }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  update-homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: meta
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          VERSION="${BRANCH#release/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download wheel and compute SHA256
+        id: sha
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          WHEEL="cboard2-${VERSION}-py3-none-any.whl"
+          URL="https://github.com/oroddlokken/cboard2/releases/download/${TAG}/${WHEEL}"
+          # The release asset takes a moment to become downloadable, so an
+          # empty digest here means too early rather than wrong.
+          for i in 1 2 3 4 5; do
+            SHA256=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
+            if [ -n "$SHA256" ]; then break; fi
+            sleep 10
+          done
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: oroddlokken/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          cd homebrew-tap
+          sed -i 's|url ".*"|url "${{ steps.sha.outputs.url }}"|' Formula/cboard2.rb
+          sed -i 's|sha256 ".*"|sha256 "${{ steps.sha.outputs.sha256 }}"|' Formula/cboard2.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cboard2.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update cboard2 to ${{ steps.meta.outputs.version }}"
+          git push

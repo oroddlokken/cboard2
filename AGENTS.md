@@ -27,3 +27,7 @@ Wait for explicit user approval before closing any issue. `dcat reopen` exists, 
 2. Tell the user the issue is ready for testing
 3. Ask: "Can I close issue [id] '[title]'?"
 4. Run `dcat close` after the user confirms
+
+## Releasing
+
+`docs/releasing.md` covers `just release-prep`, the step past which a release cannot be undone, and the Homebrew formula. Read it before running any release command.
