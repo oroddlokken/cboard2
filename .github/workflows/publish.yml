@@ -125,13 +125,18 @@ jobs:
           TAG="${{ steps.meta.outputs.tag }}"
           WHEEL="cboard2-${VERSION}-py3-none-any.whl"
           URL="https://github.com/oroddlokken/cboard2/releases/download/${TAG}/${WHEEL}"
-          # The release asset takes a moment to become downloadable, so an
-          # empty digest here means too early rather than wrong.
+          # The release asset takes a moment to become downloadable. curl -f
+          # exits non-zero on the 404 so the download is the retry condition;
+          # without it curl writes GitHub's "Not Found" body to stdout and the
+          # digest of that text goes into the formula. unzip -t catches a body
+          # that arrived with a 200 and is not a wheel.
           for i in 1 2 3 4 5; do
-            SHA256=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
-            if [ -n "$SHA256" ]; then break; fi
+            if curl -fsSL -o wheel.whl "$URL"; then break; fi
             sleep 10
           done
+          [ -s wheel.whl ] || { echo "asset never became downloadable" >&2; exit 1; }
+          unzip -tq wheel.whl || exit 1
+          SHA256=$(shasum -a 256 wheel.whl | cut -d' ' -f1)
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
