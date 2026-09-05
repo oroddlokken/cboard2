@@ -127,6 +127,17 @@ a hostile remote URL from reaching the GraphQL query it is interpolated into.
 An enterprise host does not match, and its repos stay unknown.
 """
 
+_URL_PATTERN = re.compile(
+    r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@]+@)?(?P<host>[^/:]+)(?::\d+)?/(?P<path>.*)$",
+)
+"""Origin URLs written with a scheme, whose host and path :func:`origin_key` reads."""
+
+_SCP_PATTERN = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.*)$")
+"""The scp-like form ``git@host:owner/repo.git``, which git takes without a scheme."""
+
+LOCAL_ORIGIN = "local"
+"""The key :func:`origin_key` gives an origin that is a path rather than a host."""
+
 
 @dataclass(frozen=True, slots=True)
 class PullRequest:
@@ -315,6 +326,28 @@ def parse_slug(url: str) -> str | None:
 def github_slugs(origins: Iterable[str]) -> list[str]:
     """Return the sorted GitHub slugs among ``origins``, dropping every other host."""
     return sorted({slug for url in origins if (slug := parse_slug(url)) is not None})
+
+
+def origin_key(url: str) -> str | None:
+    """Return an origin URL's host and owner, as ``github.com/ove``, or None if empty.
+
+    A host with no dot is an ssh alias or a LAN name, whose first path segment
+    is a directory rather than an owner, so it keys on the host alone. A
+    filesystem path has no host and keys as :data:`LOCAL_ORIGIN`.
+    """
+    text = url.strip()
+    if not text:
+        return None
+    if text.startswith("file://"):
+        return LOCAL_ORIGIN
+    match = _URL_PATTERN.match(text) or _SCP_PATTERN.match(text)
+    if match is None:
+        return LOCAL_ORIGIN
+    host = match["host"].lower()
+    if "." not in host:
+        return host
+    owner = match["path"].strip("/").partition("/")[0].removesuffix(".git").lower()
+    return f"{host}/{owner}" if owner else host
 
 
 def parse_symref(text: str) -> tuple[str, str] | None:
@@ -598,6 +631,7 @@ class RemoteReader:
         self._states: dict[Path, RemoteState] = {}
         self._read_at: float | None = None
         self._ancestry: dict[tuple[Path, str, str], bool] = {}
+        self._origin_urls: dict[Path, str | None] = {}
 
     @property
     def read_at(self) -> float | None:
@@ -743,10 +777,27 @@ class RemoteReader:
         or the column keeps reporting a state the user has already fixed. A
         checkout onto another branch is caught here too.
         """
+        self._adopt_origins(repos)
         known = self._covered(repos)
         if not known:
             return
         self._apply(known, self._ref_lines(known), self._checkouts(known))
+
+    def _adopt_origins(self, repos: Sequence[Repo]) -> None:
+        """Give a repo its origin URL before any network read has covered it.
+
+        ``git remote get-url`` reads a local config file, so the dashboard can
+        name every origin on its first poll rather than after the first network
+        read. A repo already asked about is skipped, which leaves the steady
+        poll with nothing to run.
+        """
+        fresh = [repo for repo in repos if repo.path not in self._origin_urls]
+        if not fresh:
+            return
+        for path, url in self._origins(fresh).items():
+            state = self._states.get(path, UNKNOWN)
+            if state.origin is None:
+                self._states[path] = replace(state, origin=url)
 
     def _covered(self, repos: Sequence[Repo]) -> list[Repo]:
         """Return the repos a read has already answered for."""
@@ -906,6 +957,7 @@ class RemoteReader:
             for family, url in self._map(origin, leaders(repos))
             if url is not None
         }
+        self._origin_urls.update({repo.path: found.get(repo.family) for repo in repos})
         return {repo.path: found[repo.family] for repo in repos if repo.family in found}
 
     def _probe(
@@ -1064,11 +1116,13 @@ class RemoteReader:
             return list(pool.map(work, items))
 
     def forget_absent(self, repos: Iterable[Repo]) -> None:
-        """Drop readings and memoized ancestry for repos off the watch list."""
+        """Drop readings, origins and memoized ancestry for repos off the watch list."""
         watched = list(repos)
         live = {repo.path for repo in watched}
         families = {repo.family for repo in watched}
         for path in [key for key in self._states if key not in live]:
             del self._states[path]
+        for path in [key for key in self._origin_urls if key not in live]:
+            del self._origin_urls[path]
         for key in [entry for entry in self._ancestry if entry[0] not in families]:
             del self._ancestry[key]

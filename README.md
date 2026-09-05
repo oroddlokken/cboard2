@@ -25,7 +25,7 @@ Each row is one repo:
 
 | Column | Content |
 |--------|---------|
-| Repo, Branch | Name and current branch |
+| Repo, Branch | Name and current branch. The name takes a color per origin host and owner, so clones under one owner match |
 | HEAD | Subject of the last commit |
 | Last commit | Age of that commit |
 | State | `S2 M1 ?3` is two staged files, one modified, three untracked |
@@ -82,6 +82,7 @@ dormant = ["~/git/old-thing"]
 | `dormant_interval` | `4h` | How often a dormant repo is polled |
 | `remote` | `true` | Whether to ask any origin anything at all |
 | `remote_interval` | `5m` | How often to ask |
+| `origin_colors` | `true` | Whether a repo's name is colored by its origin's host and owner |
 | `worktrees` | `true` | Whether a repo's linked worktrees get rows of their own |
 | `worktree_limit` | `5` | Worktree rows painted per repo before the rest fold behind one row |
 

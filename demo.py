@@ -944,6 +944,7 @@ def _demo_config() -> Config:
         dormant_interval=4 * HOUR,
         remote=False,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )

@@ -24,15 +24,18 @@ from cboard2.tui import (
     CboardApp,
     DetailScreen,
     Fold,
+    _paint,
     active_text,
     cap_worktrees,
     cursor_key,
     filter_rows,
     fold_cells,
+    origin_style,
     pr_content,
     pr_text,
     relative,
     remote_text,
+    row_cells,
     sort_rows,
 )
 
@@ -53,6 +56,7 @@ def _config(root: Path, *, dormant: tuple[Path, ...] = ()) -> Config:
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )
@@ -847,6 +851,39 @@ def test_remote_column_names_the_branch_ahead_of_the_default() -> None:
 
     assert remote_text(_row("a", remote=BEHIND_BRANCH)).plain == "behind origin/fix"
     assert remote_text(_row("b", remote=both)).plain == "behind origin/fix"
+
+
+def test_origin_style_groups_repos_by_host_and_owner() -> None:
+    ssh = _row("a", remote=replace(UNKNOWN, origin="git@github.com:ove/one.git"))
+    https = _row("b", remote=replace(UNKNOWN, origin="https://github.com/ove/two"))
+    other = _row("c", remote=replace(UNKNOWN, origin="https://gitlab.com/ove/x.git"))
+
+    assert origin_style(ssh) == origin_style(https) != ""
+    assert origin_style(other) != origin_style(ssh)
+    assert origin_style(_row("d")) == ""
+
+
+def test_repo_name_carries_the_origin_color(tmp_path: Path) -> None:
+    row = _row("a", remote=replace(UNKNOWN, origin="git@github.com:ove/one.git"))
+    here = replace(row, state=replace(row.state, path=tmp_path))
+    gone = replace(row, state=replace(row.state, path=tmp_path / "deleted"))
+
+    assert row_cells(here, 0.0)[0].style == origin_style(here)
+    assert row_cells(gone, 0.0)[0].style == "strike dim"
+
+
+def test_origin_colors_off_leaves_the_name_uncolored(tmp_path: Path) -> None:
+    row = _row("a", remote=replace(UNKNOWN, origin="git@github.com:ove/one.git"))
+    here = replace(row, state=replace(row.state, path=tmp_path))
+
+    assert row_cells(here, 0.0, colors=False)[0].style == ""
+
+
+def test_a_repo_that_gains_an_origin_repaints_its_name(tmp_path: Path) -> None:
+    plain = replace(_row("a"), state=replace(_row("a").state, path=tmp_path))
+    read = replace(plain, remote=replace(UNKNOWN, origin="git@github.com:ove/one.git"))
+
+    assert _paint(row_cells(plain, 0.0)[0]) != _paint(row_cells(read, 0.0)[0])
 
 
 def test_pr_column_counts_drafts_apart() -> None:

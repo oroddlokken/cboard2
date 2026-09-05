@@ -44,6 +44,7 @@ def _board(root: Path, *, remote: bool = False) -> Board:
         dormant_interval=4 * 3600.0,
         remote=remote,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )
@@ -77,6 +78,7 @@ def _remote_board(
         dormant_interval=4 * 3600.0,
         remote=True,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )

@@ -45,6 +45,15 @@ Set ``remote = false`` to keep cboard2 entirely off the network. Leaving it on
 costs nothing where ``gh`` is missing or unauthed: those repos read as unknown.
 """
 
+DEFAULT_ORIGIN_COLORS = True
+"""Whether a repo's name is colored by the host and owner of its origin.
+
+Every clone under one owner takes one color, so a table mixing work and
+personal repos separates at a glance. Set ``origin_colors = false`` for
+uncolored names. The origin is read from local git config, so this is
+independent of ``remote``.
+"""
+
 DEFAULT_WORKTREES = True
 """Whether a repo's linked worktrees get rows of their own.
 
@@ -74,6 +83,7 @@ class Config:
     dormant_interval: float
     remote: bool
     remote_interval: float
+    origin_colors: bool
     worktrees: bool
     worktree_limit: int
 
@@ -100,6 +110,7 @@ def default_config() -> Config:
         dormant_interval=DEFAULT_DORMANT_INTERVAL,
         remote=DEFAULT_REMOTE,
         remote_interval=DEFAULT_REMOTE_INTERVAL,
+        origin_colors=DEFAULT_ORIGIN_COLORS,
         worktrees=DEFAULT_WORKTREES,
         worktree_limit=DEFAULT_WORKTREE_LIMIT,
     )
@@ -126,6 +137,7 @@ def load_config(path: Path | None = None) -> Config:
         dormant_interval=_interval(data, "dormant_interval", DEFAULT_DORMANT_INTERVAL),
         remote=_flag(data, "remote", fallback=DEFAULT_REMOTE),
         remote_interval=_interval(data, "remote_interval", DEFAULT_REMOTE_INTERVAL),
+        origin_colors=_flag(data, "origin_colors", fallback=DEFAULT_ORIGIN_COLORS),
         worktrees=_flag(data, "worktrees", fallback=DEFAULT_WORKTREES),
         worktree_limit=_worktree_limit(data),
     )

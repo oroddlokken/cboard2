@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
+from zlib import crc32
 
 from rich.text import Text
 from textual import work
@@ -33,7 +34,7 @@ from cboard2.config import config_path
 from cboard2.configwrite import toggled, write_dormant
 from cboard2.discovery import main_name
 from cboard2.pull import pull_default
-from cboard2.remote import ORIGIN
+from cboard2.remote import ORIGIN, origin_key
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Container, Iterable, Sequence
@@ -54,8 +55,12 @@ _COLUMNS = (
     "Active",
 )
 
-type Painted = dict[str, tuple[str, ...]]
-"""The cell text last written per row key, so only changed cells are rewritten."""
+type Painted = dict[str, tuple[tuple[str, str], ...]]
+"""The text and style last written per cell, so only changed cells are rewritten.
+
+The style is held with the text because a cell can keep its text and change
+color: the repo name is uncolored until the first remote read names its origin.
+"""
 
 _SORTS = ("recent", "name", "dirty")
 """Sort orders cycled by ``s``."""
@@ -267,6 +272,42 @@ def ahead_behind_text(row: Row) -> Text:
     return Text(" ".join(parts), style="cyan" if state.ahead else "magenta")
 
 
+_ORIGIN_COLORS = (
+    "#5f87af",
+    "#87af5f",
+    "#af5f87",
+    "#d7875f",
+    "#5faf87",
+    "#af87d7",
+    "#afaf5f",
+    "#5fafd7",
+    "#d75f87",
+    "#af875f",
+    "#87d7af",
+    "#8787d7",
+)
+"""Colors a repo name takes, one per origin host and owner.
+
+Mid-tone, so they hold up on a light terminal and on a dark one, and clear of
+the colors the other columns spend on meaning: yellow for behind, cyan for
+ahead and for the PR count, magenta for the unpushed count.
+"""
+
+
+def origin_style(row: Row) -> str:
+    """Return the color for this repo's origin owner, or "" when it has no origin.
+
+    Repos under the same host and owner share a color, so a glance down the
+    name column groups them. crc32 rather than ``hash`` keeps a repo the same
+    color between runs, which the salted builtin would not.
+    """
+    origin = row.remote.origin
+    key = None if origin is None else origin_key(origin)
+    if key is None:
+        return ""
+    return _ORIGIN_COLORS[crc32(key.encode()) % len(_ORIGIN_COLORS)]
+
+
 def remote_text(row: Row) -> Text:
     """Render which branch has commits on the origin this clone has not pulled.
 
@@ -350,14 +391,19 @@ def active_text(row: Row, now: float) -> Text:
     return Text(f"{label} (read {age})", style="dim")
 
 
-def row_cells(row: Row, now: float) -> tuple[Text, ...]:
-    """Render one repo as the cells of a table row."""
+def row_cells(row: Row, now: float, *, colors: bool = True) -> tuple[Text, ...]:
+    """Render one repo as the cells of a table row.
+
+    ``colors`` off leaves the name uncolored, which is what
+    ``origin_colors = false`` asks for.
+    """
     state = row.state
     exists = Path(state.path).exists()
+    name = origin_style(row) if colors else ""
     return (
         Text(
             state.row_label if exists else f"✗ {state.row_label.lstrip()}",
-            style="" if exists else "strike dim",
+            style=name if exists else "strike dim",
         ),
         branch_text(row),
         head_text(row),
@@ -386,11 +432,21 @@ def fold_cells(fold: Fold) -> tuple[Text, ...]:
     return (Text(label, style="dim"), Text(action, style="dim"), *blanks)
 
 
-def painted_row(entry: Row | Fold, now: float) -> tuple[str, tuple[Text, ...]]:
+def _paint(cell: Text) -> tuple[str, str]:
+    """Return what a cell shows, as the pair a repaint compares."""
+    return cell.plain, str(cell.style)
+
+
+def painted_row(
+    entry: Row | Fold,
+    now: float,
+    *,
+    colors: bool = True,
+) -> tuple[str, tuple[Text, ...]]:
     """Return the table key and cells for a repo row or a fold row."""
     if isinstance(entry, Fold):
         return entry.key, fold_cells(entry)
-    return str(entry.state.path), row_cells(entry, now)
+    return str(entry.state.path), row_cells(entry, now, colors=colors)
 
 
 def cursor_key(table: DataTable[str | Text]) -> str | None:
@@ -490,7 +546,8 @@ class DetailScreen(ModalScreen[None]):
         remote = self._row.remote
         if remote.origin is None:
             return Content.styled("no origin", "dim")
-        label = remote.slug or remote.origin
+        color = origin_style(self._row) if self._board.config.origin_colors else ""
+        label = (remote.slug or remote.origin, color)
         if not remote.default_known:
             return Content.assemble(label, "  ", ("not read", "dim"))
         if remote.behind_branch:
@@ -770,7 +827,10 @@ class CboardApp(App[None]):
             limit=self._board.config.worktree_limit,
         )
         now = self._clock()
-        cells = [painted_row(entry, now) for entry in visible]
+        cells = [
+            painted_row(entry, now, colors=self._board.config.origin_colors)
+            for entry in visible
+        ]
         keys = tuple(key for key, _ in cells)
         folds = [entry for entry in visible if isinstance(entry, Fold)]
 
@@ -780,7 +840,7 @@ class CboardApp(App[None]):
         else:
             self.write_changed(table, cells)
 
-        self._painted = {key: tuple(cell.plain for cell in row) for key, row in cells}
+        self._painted = {key: tuple(_paint(cell) for cell in row) for key, row in cells}
         self._reorder = False
         self.sub_title = self.status_text(
             len(visible) - len(folds),
@@ -814,7 +874,7 @@ class CboardApp(App[None]):
         for key, row in cells:
             previous = self._painted.get(key)
             for index, cell in enumerate(row):
-                if previous is not None and previous[index] == cell.plain:
+                if previous is not None and previous[index] == _paint(cell):
                     continue
                 table.update_cell(key, columns[index], cell)
 

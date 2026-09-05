@@ -26,6 +26,7 @@ def _board(root: Path) -> Board:
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )
@@ -113,6 +114,7 @@ def test_read_remote_walks_the_roots_before_its_first_read(tmp_path: Path) -> No
         dormant_interval=4 * 3600.0,
         remote=True,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )

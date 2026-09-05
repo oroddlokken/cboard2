@@ -9,6 +9,7 @@ import pytest
 from cboard2.config import (
     DEFAULT_DORMANT_INTERVAL,
     DEFAULT_MAX_DEPTH,
+    DEFAULT_ORIGIN_COLORS,
     DEFAULT_REMOTE,
     DEFAULT_WORKTREE_LIMIT,
     ConfigError,
@@ -78,6 +79,13 @@ def test_reads_every_key(tmp_path: Path) -> None:
     assert config.dormant_interval == 1800.0
 
 
+def test_reads_the_origin_colors_flag(tmp_path: Path) -> None:
+    assert (
+        load_config(_write(tmp_path, "origin_colors = false\n")).origin_colors is False
+    )
+    assert load_config(tmp_path / "absent.toml").origin_colors is DEFAULT_ORIGIN_COLORS
+
+
 def test_reads_the_worktree_limit(tmp_path: Path) -> None:
     config = load_config(_write(tmp_path, "worktree_limit = 12\n"))
 
@@ -100,6 +108,7 @@ def test_bare_number_interval_is_seconds(tmp_path: Path) -> None:
         ("max_depth = -1\n", "max_depth"),
         ("worktree_limit = -2\n", "worktree_limit"),
         ('worktree_limit = "five"\n', "worktree_limit"),
+        ('origin_colors = "off"\n', "origin_colors"),
         ('max_depth = "deep"\n', "max_depth"),
     ],
 )

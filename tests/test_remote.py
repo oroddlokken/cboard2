@@ -17,6 +17,7 @@ from cboard2.remote import (
     branch_variables,
     build_query,
     github_slugs,
+    origin_key,
     parse_branch_tips,
     parse_defaults,
     parse_heads,
@@ -182,6 +183,28 @@ def _pr(
 )
 def test_parse_slug_names_only_github_origins(url: str, expected: str | None) -> None:
     assert parse_slug(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@github.com:owner/name.git", "github.com/owner"),
+        ("https://github.com/owner/name", "github.com/owner"),
+        ("https://github.com/owner/name/", "github.com/owner"),
+        ("https://gitlab.com/owner/name.git", "gitlab.com/owner"),
+        ("ssh://git@gitlab.com:2222/owner/name.git", "gitlab.com/owner"),
+        ("https://github.com/OWNER/Name", "github.com/owner"),
+        ("  git@github.com:owner/name.git\n", "github.com/owner"),
+        ("git@github.com:name.git", "github.com/name"),  # a user's own top-level repo
+        ("nas:git/name.git", "nas"),  # an ssh alias, whose path is a directory
+        ("git@nas.local:git/name.git", "nas.local/git"),
+        ("/srv/mirrors/name.git", "local"),
+        ("file:///srv/mirrors/name.git", "local"),
+        ("", None),
+    ],
+)
+def test_origin_key_names_a_host_and_owner(url: str, expected: str | None) -> None:
+    assert origin_key(url) == expected
 
 
 @pytest.mark.parametrize(
@@ -440,15 +463,29 @@ def test_an_untouched_repo_costs_no_second_merge_base(tmp_path: Path) -> None:
     assert reader.cached(repo.path).behind_default is True
 
 
-def test_refresh_local_before_any_read_does_nothing(tmp_path: Path) -> None:
+def test_refresh_local_before_any_read_reads_only_the_origin(tmp_path: Path) -> None:
     repo = _repo(tmp_path, "one")
     git = FakeGit({repo.path: {"for-each-ref": f"main\t{LOCAL_SHA}\n"}})
     reader = RemoteReader(runner=git, gh=FakeGh(graphql=None, prs=None))
 
     reader.refresh_local([repo])
 
-    assert git.calls == []
+    assert [args[0] for _, args in git.calls] == ["remote"]
     assert reader.cached(repo.path).behind_default is False
+
+
+def test_refresh_local_names_the_origin_before_any_network_read(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "git@github.com:acme/one.git\n"}})
+    reader = RemoteReader(runner=git, gh=FakeGh(graphql=None, prs=None))
+
+    reader.refresh_local([repo])
+    reader.refresh_local([repo])
+
+    assert reader.cached(repo.path).origin == "git@github.com:acme/one.git"
+    assert [args[0] for _, args in git.calls] == ["remote"]  # asked once, then memoized
 
 
 def test_an_origin_that_answers_nothing_is_unknown(tmp_path: Path) -> None:

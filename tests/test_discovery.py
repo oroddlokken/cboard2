@@ -30,6 +30,7 @@ def _config(
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=worktrees,
         worktree_limit=5,
     )
@@ -123,6 +124,7 @@ def test_overlapping_roots_return_each_repo_once(
         dormant_interval=4 * 3600.0,
         remote=False,
         remote_interval=300.0,
+        origin_colors=True,
         worktrees=True,
         worktree_limit=5,
     )
