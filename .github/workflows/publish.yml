@@ -41,6 +41,24 @@ jobs:
 
       - run: just check-sdist
 
+      # The tap push is the last step of a release and the first that needs
+      # this token, so its write access is probed here instead. The repo API's
+      # permissions.push reports the user's role, which is push for the owner
+      # whatever the token itself can do.
+      - name: Check tap write access
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -u "x-access-token:${TAP_TOKEN}" \
+            "https://github.com/oroddlokken/homebrew-tap.git/info/refs?service=git-receive-pack")
+          if [ "$CODE" != "200" ]; then
+            echo "HOMEBREW_TAP_TOKEN cannot push to oroddlokken/homebrew-tap (HTTP $CODE)." >&2
+            echo "Set the token's Contents permission to Read and write, then rerun." >&2
+            exit 1
+          fi
+          echo "Tap write access confirmed."
+
       - name: Extract version from branch name
         id: version
         run: |

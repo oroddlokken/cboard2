@@ -47,8 +47,8 @@ The tap is a separate repo with no checkout under `~/git`. Clone it before editi
 assuming a nearby directory is it.
 
 The `update-homebrew` job reads `HOMEBREW_TAP_TOKEN` from this repo's secrets — a PAT with
-`contents:write` on the tap. Without it the job fails at the tap checkout, after the tag and the
-GitHub release have already gone out.
+`contents:write` on the tap. The publish job probes that write access ahead of the tag push, so a
+token that can only read the tap fails the release before anything is published.
 
 ## `just check-sdist` guards the tarball
 
