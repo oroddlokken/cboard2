@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.0 (2026-09-05)
+
 ### Added
 
 - **A repo's linked worktrees get rows of their own**, indented as `  ⑂ worktree`, including one kept inside its repo where the directory walk never reaches it. Every sort order paints a repo and its worktrees as one block, placed where the group's most interesting member falls. The origin URL, the open PRs and the default branch are read once per repo and shown on each of its worktrees, since they share `refs`.
