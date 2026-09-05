@@ -49,3 +49,14 @@ assuming a nearby directory is it.
 The `update-homebrew` job reads `HOMEBREW_TAP_TOKEN` from this repo's secrets — a PAT with
 `contents:write` on the tap. Without it the job fails at the tap checkout, after the tag and the
 GitHub release have already gone out.
+
+## `just check-sdist` guards the tarball
+
+`scripts/check-sdist` fails a source distribution over 1 MiB or holding a top-level entry outside
+its allowlist. The include-list in `pyproject.toml` is what keeps the tarball to `src/`, `docs/`
+and three files; nothing else notices that section being loosened.
+
+It runs on every pull request in `ci.yml`, and in `publish.yml` ahead of the tag push, because that
+push is the first irreversible step. A directory that belongs in the sdist goes into the
+include-list and into `ALLOWED` in the script. A cache belongs in the root `.gitignore`, which is
+the copy hatchling reads.

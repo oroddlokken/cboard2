@@ -33,11 +33,13 @@ jobs:
 
       - run: uv sync --group dev
 
-      # Both checks run ahead of the tag push, which is the first irreversible
+      # These checks run ahead of the tag push, which is the first irreversible
       # step: a failure after it would leave vX.Y.Z on origin with no release.
       - run: just lint-all
 
       - run: just test-all
+
+      - run: just check-sdist
 
       - name: Extract version from branch name
         id: version

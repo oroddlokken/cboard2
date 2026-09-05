@@ -45,6 +45,17 @@ test-changed:
 test-all:
     COVERAGE_CORE=sysmon uv run pytest --timeout 60 -n 8 tests --cov-report=html --cov=src/cboard2
 
+# fail a source distribution that grew or picked up an unexpected entry
+check-sdist:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Built into a temp dir rather than dist/, which holds artifacts from
+    # earlier builds that would make the tarball ambiguous.
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    uv build --sdist --out-dir "$out" -q
+    ./scripts/check-sdist "$out"/*.tar.gz
+
 # show next possible versions (patch or minor bump)
 next:
     #!/usr/bin/env bash

@@ -42,6 +42,19 @@ version-file = "src/cboard2/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/cboard2"]
 
+[tool.hatch.build.targets.sdist]
+# An include-list, not an exclude-list, because hatchling reads the root
+# .gitignore alone: a directory a tool gitignores from inside itself stays
+# invisible to git status and still ships. Without this section the tarball
+# swept in assets/cboard2.png and the whole .dogcats store, 1.29 MiB of it.
+include = [
+  "/src",
+  "/docs",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/LICENSE",
+]
+
 # PEP 735 dependency groups — NOT [project.optional-dependencies]
 [dependency-groups]
 dev = [
