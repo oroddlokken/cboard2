@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from typing import TYPE_CHECKING
 
+import pytest
 from conftest import git
 
 from cboard2.config import DEFAULT_MAX_DEPTH, Config
-from cboard2.discovery import discover
+from cboard2.discovery import (
+    Repo,
+    discover,
+    load_repos,
+    repo_cache_path,
+    save_repos,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from conftest import RepoFactory
+
+START = 1_800_000_000.0
+TTL = 30.0
+"""The window a board gives the stored list, matching board.RESCAN_INTERVAL."""
 
 
 def _config(
@@ -197,3 +209,132 @@ def test_a_dormant_root_covers_its_worktrees(
     }
 
     assert found == {git_repo: True, worktree: True}
+
+
+def test_a_dormant_entry_does_not_flag_a_name_it_prefixes(
+    tree: Path,
+    make_repo: RepoFactory,
+) -> None:
+    shelf = tree / "shelf"
+    old = make_repo("shelf/old")
+    live = make_repo("shelfed")
+
+    found = {
+        repo.path: repo.dormant for repo in discover(_config(tree, dormant=(shelf,)))
+    }
+
+    assert found == {old: True, live: False}
+
+
+def test_a_dormant_entry_reaches_a_deeply_nested_repo(
+    tree: Path,
+    make_repo: RepoFactory,
+) -> None:
+    shelf = tree / "shelf"
+    deep = make_repo("shelf/one/two/three")
+
+    (found,) = discover(_config(tree, dormant=(shelf,)))
+
+    assert (found.path, found.dormant) == (deep, True)
+
+
+def test_the_stored_list_round_trips(
+    tree: Path, git_repo: Path, worktree: Path
+) -> None:
+    config = _config(tree)
+    target = tree / "store" / "repos.json"
+    walked = discover(config)
+
+    assert save_repos(target, config, walked, START) is True
+    assert load_repos(target, config, START + 1, TTL) == walked
+    assert [repo.path for repo in walked] == [git_repo, worktree]
+
+
+def test_the_stored_list_expires(tree: Path, make_repo: RepoFactory) -> None:
+    make_repo("alpha")
+    config = _config(tree)
+    target = tree / "store" / "repos.json"
+    save_repos(target, config, discover(config), START)
+
+    assert load_repos(target, config, START + TTL, TTL) is None
+
+
+def test_a_stored_list_stamped_ahead_of_now_is_refused(
+    tree: Path,
+    make_repo: RepoFactory,
+) -> None:
+    """A clock that went backwards must not pin the list until it catches up."""
+    make_repo("alpha")
+    config = _config(tree)
+    target = tree / "store" / "repos.json"
+    save_repos(target, config, discover(config), START)
+
+    assert load_repos(target, config, START - 1, TTL) is None
+
+
+def test_a_different_watch_list_ignores_the_stored_list(
+    tree: Path,
+    make_repo: RepoFactory,
+) -> None:
+    make_repo("shelf/alpha")
+    config = _config(tree)
+    target = tree / "store" / "repos.json"
+    save_repos(target, config, discover(config), START)
+
+    assert load_repos(target, _config(tree, max_depth=9), START, TTL) is None
+    assert load_repos(target, _config(tree, dormant=(tree,)), START, TTL) is None
+    assert load_repos(target, _config(tree, worktrees=False), START, TTL) is None
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "",
+        "{ truncated",
+        "[]",
+        '{"version": 0, "scanned_at": 1.0, "repos": []}',
+        '{"version": 1, "repos": []}',
+    ],
+    ids=["empty", "truncated", "not-an-object", "wrong-version", "no-timestamp"],
+)
+def test_an_unusable_stored_list_reads_as_cold(tree: Path, written: str) -> None:
+    target = tree / "repos.json"
+    target.write_text(written, encoding="utf-8")
+
+    assert load_repos(target, _config(tree), START, TTL) is None
+
+
+def test_a_missing_stored_list_reads_as_cold(tree: Path) -> None:
+    assert load_repos(tree / "absent.json", _config(tree), START, TTL) is None
+
+
+def test_one_unusable_entry_discards_the_whole_stored_list(tree: Path) -> None:
+    config = _config(tree)
+    target = tree / "store" / "repos.json"
+    save_repos(target, config, [Repo(path=tree / "a", name="a", dormant=False)], START)
+    body = json.loads(target.read_text(encoding="utf-8"))
+    body["repos"].append({"path": str(tree / "b"), "name": "b"})
+    target.write_text(json.dumps(body), encoding="utf-8")
+
+    assert load_repos(target, config, START, TTL) is None
+
+
+def test_an_unwritable_directory_reports_the_write_failed(tree: Path) -> None:
+    blocked = tree / "blocked"
+    blocked.write_text("a file, not a directory\n", encoding="utf-8")
+
+    assert save_repos(blocked / "repos.json", _config(tree), [], START) is False
+
+
+def test_the_stored_list_path_follows_the_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CBOARD2_REPO_CACHE", str(tmp_path / "named.json"))
+
+    assert repo_cache_path() == tmp_path / "named.json"
+
+    monkeypatch.delenv("CBOARD2_REPO_CACHE")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    assert repo_cache_path() == tmp_path / "cboard2" / "repos.json"

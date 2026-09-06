@@ -15,3 +15,4 @@ scratch
 .dogcats/config.local.toml
 .dogcats/.issues.lock
 src/cboard2/_version.py
+.claude-cache/

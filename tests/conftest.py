@@ -21,6 +21,17 @@ class RepoFactory(Protocol):
         ...
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point both cache files at this test's own directory.
+
+    ``repo_cache_path`` and ``cache_path`` both fall back to ``~/.cache``, so
+    without this a test that builds a Board writes the machine's real repo
+    list and remote reading. A test that sets the var itself still wins.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+
+
 @pytest.fixture
 def tree(tmp_path: Path) -> Path:
     """Return an empty directory to build a repo layout under."""

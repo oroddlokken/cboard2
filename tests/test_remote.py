@@ -3,23 +3,32 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from cboard2.constants import REMOTE_MAX_WORKERS
 from cboard2.discovery import Repo
 from cboard2.remote import (
+    ANCESTRY_LIMIT,
     CHECKS_FAILING,
     CHECKS_NONE,
     CHECKS_PASSING,
     CHECKS_PENDING,
     CHECKS_UNKNOWN,
+    PR_SEARCH_LIMIT,
+    UNKNOWN,
     Cached,
     PullRequest,
     RemoteReader,
+    RemoteState,
     branch_variables,
     build_query,
     checks_mark,
@@ -35,14 +44,14 @@ from cboard2.remote import (
     parse_symref,
     parse_upstreams,
     parse_worktrees,
+    ref_mark,
     run_gh,
     target_branch,
     worst_checks,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-    from pathlib import Path
+    from collections.abc import Iterator, Mapping, Sequence
 
 NOW = 1_800_000_000.0
 """A fixed clock, so the interval gate is exercised without sleeping."""
@@ -1756,3 +1765,368 @@ def test_worst_checks_ranks_the_state_worth_acting_on_first() -> None:
     assert worst_checks([]) == CHECKS_UNKNOWN
     assert checks_mark(CHECKS_UNKNOWN) == ""
     assert checks_mark(CHECKS_NONE) == ""
+
+
+def test_a_read_landing_between_the_patch_and_the_fold_keeps_its_reading(
+    tmp_path: Path,
+) -> None:
+    """A poll patch computed before a read folds onto the read, not over it."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "for-each-ref": f"main\t{REMOTE_SHA}\n",
+            },
+        },
+    )
+    gh = FakeGh(
+        graphql=_graphql(("main", REMOTE_SHA)),
+        prs=json.dumps([_pr("acme/one", 4)]),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+
+    patches = reader._adopt_origins([repo])  # noqa: SLF001 — the poll thread's half
+    assert reader.read([repo], NOW) is True  # the remote thread's rebuild
+    reader._fold(patches)  # noqa: SLF001 — folded after the swap
+
+    state = reader.cached(repo.path)
+    assert state.origin == "https://github.com/acme/one.git"
+    assert state.default_sha == REMOTE_SHA
+    assert [pr.number for pr in state.prs] == [4]
+
+
+class _SwappingStates(dict[Path, RemoteState]):
+    """A states dict handing the reader a rebuilt one the moment it is iterated.
+
+    Stands in for a remote read finishing inside ``forget_absent``.
+    """
+
+    def __init__(
+        self,
+        reader: RemoteReader,
+        rebuilt: dict[Path, RemoteState],
+    ) -> None:
+        super().__init__()
+        self.reader = reader
+        self.rebuilt = rebuilt
+
+    def __iter__(self) -> Iterator[Path]:
+        self.reader._states = self.rebuilt  # noqa: SLF001 — the read landing mid-call
+        return super().__iter__()
+
+
+def test_forget_absent_survives_a_read_landing_mid_call(tmp_path: Path) -> None:
+    """A rebuild between the snapshot and the deletes keeps its live entry."""
+    live = _repo(tmp_path, "one")
+    gone = _repo(tmp_path, "two")
+    reader = RemoteReader(runner=FakeGit({}), gh=FakeGh(graphql=None, prs=None))
+    fresh = RemoteState(
+        origin="https://github.com/acme/one.git",
+        default_sha=REMOTE_SHA,
+        default_known=True,
+    )
+    swapping = _SwappingStates(reader, {live.path: fresh})
+    swapping[live.path] = RemoteState()
+    swapping[gone.path] = RemoteState(origin="https://github.com/acme/two.git")
+    reader._states = swapping  # noqa: SLF001 — the dict the poll thread captures
+
+    reader.forget_absent([live])
+
+    assert reader.cached(live.path) == fresh
+    assert reader.cached(gone.path) is UNKNOWN
+
+
+def test_the_ancestry_memo_stops_growing(tmp_path: Path) -> None:
+    """A repo that keeps advancing while behind does not grow the memo forever."""
+    repo = _repo(tmp_path, "one")
+    local = f"{0:040x}"
+
+    def git(_root: Path, args: Sequence[str]) -> str | None:
+        if args[0] == "remote":
+            return "https://github.com/acme/one.git\n"
+        if args[0] == "for-each-ref":
+            return f"main\t{local}\n"
+        if args[0] == "merge-base":
+            return None
+        return ""
+
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(runner=git, gh=gh)
+    assert reader.read([repo], NOW) is True
+
+    for step in range(1, ANCESTRY_LIMIT * 2):
+        local = f"{step:040x}"
+        reader.refresh_local([repo])
+
+    assert len(reader._ancestry) == ANCESTRY_LIMIT  # noqa: SLF001 — the ceiling
+
+
+def test_prime_reads_the_local_refs_once(tmp_path: Path) -> None:
+    """The stored read derives its behind markers from the refs it already read."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/one.git\n",
+                "worktree": _listing((repo.path, "main")),
+                "for-each-ref": _heads(
+                    ("main", LOCAL_SHA, "origin", "refs/heads/main")
+                ),
+                "merge-base": None,
+            },
+        },
+    )
+    stored = Cached(read_at=NOW - 60.0, defaults={"acme/one": ("main", REMOTE_SHA)})
+    reader = RemoteReader(
+        runner=git,
+        gh=FakeGh(graphql=None, prs=None),
+        load=lambda: stored,
+    )
+
+    assert reader.prime([repo]) is True
+
+    ran = [args[0] for _, args in git.calls]
+    assert ran.count("for-each-ref") == 1
+    assert ran.count("worktree") == 1
+    assert reader.cached(repo.path).behind_default is True
+
+
+def test_the_worker_count_matches_the_measurement_in_the_docstring() -> None:
+    """The pool runs at the count RemoteReader's docstring measured."""
+    assert RemoteReader.__doc__ is not None
+    assert f"at {REMOTE_MAX_WORKERS} workers" in RemoteReader.__doc__
+
+
+def test_a_stalled_probe_does_not_hold_the_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unreachable origin is dropped at the deadline; the rest still answer."""
+    slow = _repo(tmp_path, "slow")
+    quick = _repo(tmp_path, "quick")
+    git = FakeGit(
+        {
+            slow.path: {"remote": "git@git.example.com:acme/slow.git\n"},
+            quick.path: {"remote": "git@git.example.com:acme/quick.git\n"},
+        },
+    )
+    released = threading.Event()
+
+    def probe(root: Path, _args: Sequence[str]) -> str | None:
+        if root == slow.path:
+            released.wait(10.0)
+            return None
+        return SYMREF
+
+    monkeypatch.setattr("cboard2.remote.PROBE_TIMEOUT", 0.2)
+    reader = RemoteReader(
+        runner=git,
+        ls_remote=probe,
+        gh=FakeGh(graphql=None, prs=None),
+    )
+
+    started = time.monotonic()
+    try:
+        assert reader.read([slow, quick], NOW) is True
+        elapsed = time.monotonic() - started
+    finally:
+        released.set()
+
+    assert elapsed < 2.0
+    assert reader.cached(quick.path).default_branch == "trunk"
+    assert reader.cached(slow.path).default_known is False
+
+
+def test_the_independent_read_phases_overlap(tmp_path: Path) -> None:
+    """The two local git batches and the two PR searches run at once.
+
+    The barrier only clears when all four are in flight, so a sequential read
+    breaks it rather than passing. ``worktree list`` is left out: it shares a
+    pool task with ``for-each-ref`` and runs after it, so waiting on it would
+    hold a barrier the other three have already cleared.
+    """
+    repo = _repo(tmp_path, "one")
+    at_once = threading.Barrier(4)
+
+    def git(_root: Path, args: Sequence[str]) -> str | None:
+        if args[0] in {"remote", "for-each-ref"}:
+            at_once.wait(timeout=10.0)
+        if args[0] == "remote":
+            return "https://github.com/acme/one.git\n"
+        return ""
+
+    def gh(args: Sequence[str]) -> str | None:
+        if args[0] == "search":
+            at_once.wait(timeout=10.0)
+            return "[]"
+        return _graphql(("main", REMOTE_SHA))
+
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([repo], NOW) is True
+    assert reader.cached(repo.path).default_sha == REMOTE_SHA
+
+
+@pytest.mark.parametrize(
+    ("updated", "expected"),
+    [
+        ("2026-09-04T12:00:35Z", UPDATED_EPOCH),
+        (
+            "2026-09-04T14:00:35+02:00",
+            datetime(2026, 9, 4, 12, 0, 35, tzinfo=UTC).timestamp(),
+        ),
+        ("2026-09-04T12:00:35", None),
+    ],
+)
+def test_a_pr_timestamp_needs_an_offset(updated: str, expected: float | None) -> None:
+    """An offset-less string is dropped rather than read in the host's zone."""
+    entry = _pr("acme/one", 4)
+    entry["updatedAt"] = updated
+
+    found = parse_prs(json.dumps([entry]))
+
+    assert found is not None
+    assert found["acme/one"][0].updated_at == expected
+
+
+def _search_results(count: int) -> str:
+    """Build a search result set of ``count`` PRs, all on one repo."""
+    return json.dumps([_pr("acme/one", number) for number in range(1, count + 1)])
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(PR_SEARCH_LIMIT, True), (PR_SEARCH_LIMIT - 1, False)],
+    ids=["at-the-limit", "under-it"],
+)
+def test_a_search_at_the_limit_reports_its_prs_truncated(
+    tmp_path: Path,
+    count: int,
+    *,
+    expected: bool,
+) -> None:
+    """A result set of exactly PR_SEARCH_LIMIT is the only signal gh gives."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs=_search_results(count))
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([repo], NOW) is True
+
+    state = reader.cached(repo.path)
+    assert state.prs_truncated is expected
+    assert state.review_prs_truncated is False
+
+
+def test_the_review_search_reports_its_own_truncation(tmp_path: Path) -> None:
+    """The two searches hit the limit separately, and carry separate flags."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(
+        graphql=_graphql(("main", REMOTE_SHA)),
+        prs="[]",
+        review=_search_results(PR_SEARCH_LIMIT),
+    )
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([repo], NOW) is True
+
+    state = reader.cached(repo.path)
+    assert state.prs_truncated is False
+    assert state.review_prs_truncated is True
+
+
+def test_a_failed_search_reports_no_truncation(tmp_path: Path) -> None:
+    """A search that never answered found nothing to cut short."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs=None, review=None)
+    reader = RemoteReader(runner=git, gh=gh)
+
+    assert reader.read([repo], NOW) is True
+
+    state = reader.cached(repo.path)
+    assert state.prs_known is False
+    assert state.prs_truncated is False
+    assert state.review_prs_truncated is False
+
+
+def test_prime_serves_the_stored_truncation_flags(tmp_path: Path) -> None:
+    """A restart inside the interval keeps saying the PR list is short."""
+    repo = _repo(tmp_path, "one")
+    git = FakeGit({repo.path: {"remote": "https://github.com/acme/one.git\n"}})
+    stored = Cached(
+        read_at=NOW - 60.0,
+        defaults={"acme/one": ("main", REMOTE_SHA)},
+        prs={"acme/one": (_pr_object(4),)},
+        prs_known=True,
+        prs_truncated=True,
+    )
+    reader = RemoteReader(
+        runner=git,
+        gh=FakeGh(graphql=None, prs=None),
+        load=lambda: stored,
+    )
+
+    assert reader.prime([repo]) is True
+
+    state = reader.cached(repo.path)
+    assert state.prs_truncated is True
+    assert state.review_prs_truncated is False
+
+
+def test_an_unchanged_second_poll_runs_no_local_git_batch(git_repo: Path) -> None:
+    """The gate this guards: an idle watch list must not respawn git every 2s."""
+    repo = Repo(path=git_repo, name="repo", dormant=False)
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/repo.git\n",
+                "for-each-ref": f"main\t{LOCAL_SHA}\n",
+                "worktree": _listing((repo.path, "main")),
+                "merge-base": None,
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(300.0, runner=git, gh=gh)
+    reader.read([repo], NOW)
+    reader.refresh_local([repo])
+    settled = len(git.calls)
+
+    reader.refresh_local([repo])
+
+    assert len(git.calls) == settled
+
+
+def test_a_moved_ref_reopens_the_gate(git_repo: Path) -> None:
+    repo = Repo(path=git_repo, name="repo", dormant=False)
+    git = FakeGit(
+        {
+            repo.path: {
+                "remote": "https://github.com/acme/repo.git\n",
+                "for-each-ref": f"main\t{LOCAL_SHA}\n",
+                "worktree": _listing((repo.path, "main")),
+                "merge-base": None,
+            },
+        },
+    )
+    gh = FakeGh(graphql=_graphql(("main", REMOTE_SHA)), prs="[]")
+    reader = RemoteReader(300.0, runner=git, gh=gh)
+    reader.read([repo], NOW)
+    reader.refresh_local([repo])
+    settled = len(git.calls)
+
+    # What a commit or a pull leaves behind: refs/heads/main written again.
+    head = git_repo / ".git" / "refs" / "heads" / "main"
+    head.write_text(f"{REMOTE_SHA}\n", encoding="utf-8")
+    os.utime(head, (time.time() + 5, time.time() + 5))
+    reader.refresh_local([repo])
+
+    assert len(git.calls) > settled
+
+
+def test_a_family_with_no_git_directory_is_never_gated(tmp_path: Path) -> None:
+    """A path the mark cannot stat has to run both batches every poll."""
+    assert ref_mark(tmp_path / "missing" / ".git") is None

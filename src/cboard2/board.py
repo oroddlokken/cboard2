@@ -8,12 +8,14 @@ current state, :mod:`cboard2.activity` reads what happened in them and
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from cboard2.activity import ActivityReader
-from cboard2.discovery import discover
+from cboard2.discovery import discover, load_repos, repo_cache_path, save_repos
 from cboard2.gitstate import Poller
 from cboard2.remote import UNKNOWN, RemoteReader
 from cboard2.remotecache import cache_path
@@ -30,6 +32,9 @@ if TYPE_CHECKING:
     from cboard2.gitstate import RepoState
     from cboard2.remote import RemoteState
 
+_READERS = 3
+"""Readers a tick runs at once: the poller, the remote refresh and the reflogs."""
+
 DEFAULT_FEED_LIMIT = 200
 """Activity entries returned by :meth:`Board.activity` unless asked otherwise."""
 
@@ -37,7 +42,8 @@ RESCAN_INTERVAL = 30.0
 """Seconds between walks of the roots, so a clone or a deletion is noticed.
 
 The walk costs about 0.3s over ``~/git``, too much for every 2s poll and
-cheap enough twice a minute.
+cheap enough twice a minute. Doubles as the life of the stored repo list, so a
+one-shot ``cboard ls`` reuses a walk another process paid for within the window.
 """
 
 
@@ -54,15 +60,18 @@ class Row:
     supply, and unknown is the honest value there.
     """
 
-    @property
-    def active_at(self) -> float:
-        """Newest of the last HEAD movement and the last working-tree edit.
+    active_at: float = field(init=False)
+    """Newest of the last HEAD movement and the last working-tree edit.
 
-        Falls back to HEAD's commit time, which is all a repo has when its
-        reflog is disabled and its tree is clean.
-        """
+    Falls back to HEAD's commit time, which is all a repo has when its reflog
+    is disabled and its tree is clean. Computed once here because a sort, a
+    filter and two renderers read it within one pass over the same frozen row.
+    """
+
+    def __post_init__(self) -> None:
         known = [at for at in (self.moved_at, self.state.last_edit) if at is not None]
-        return max(known) if known else float(self.state.head_time or 0)
+        newest = max(known) if known else float(self.state.head_time or 0)
+        object.__setattr__(self, "active_at", newest)
 
 
 class Board:
@@ -81,7 +90,10 @@ class Board:
         self._reader = reader or ActivityReader()
         self._remote = remote or _default_reader(config)
         self._repos: list[Repo] = []
+        self._by_path: dict[Path, Repo] = {}
         self._scanned_at: float | None = None
+        self._scan_lock = threading.Lock()
+        self._scans = 0
 
     @property
     def repos(self) -> list[Repo]:
@@ -90,11 +102,40 @@ class Board:
 
     def rescan(self, *, now: float | None = None) -> list[Repo]:
         """Walk the roots again and drop readings for repos that went away."""
-        self._repos = discover(self.config)
-        self._scanned_at = time.time() if now is None else now
-        self._reader.forget_absent(self._repos)
-        self._remote.forget_absent(self._repos)
-        return self._repos
+        return self._scan(time.time() if now is None else now, stored=False)
+
+    def _scan(self, moment: float, *, stored: bool) -> list[Repo]:
+        """Take a fresh repo list, from the cache file when ``stored`` allows it.
+
+        A caller that arrives while a scan is running waits for it and takes
+        its result. The dashboard starts its poll thread and its remote thread
+        moments apart and both scan on the first tick, so without this the
+        roots are walked twice at once.
+        """
+        seen = self._scans
+        with self._scan_lock:
+            if self._scans > seen:
+                return self._repos
+            target = repo_cache_path()
+            found = (
+                load_repos(target, self.config, moment, RESCAN_INTERVAL)
+                if stored
+                else None
+            )
+            if found is None:
+                found = discover(self.config)
+                save_repos(target, self.config, found, moment)
+            self._adopt(found, moment)
+            self._scans += 1
+            return self._repos
+
+    def _adopt(self, repos: list[Repo], moment: float) -> None:
+        """Take ``repos`` as the current list and drop readings for what went away."""
+        self._repos = repos
+        self._by_path = {repo.path: repo for repo in repos}
+        self._scanned_at = moment
+        self._reader.forget_absent(repos)
+        self._remote.forget_absent(repos)
 
     def refresh(
         self,
@@ -107,25 +148,36 @@ class Board:
 
         ``force`` polls dormant repos too, ignoring their interval. ``rescan``
         walks the roots without waiting for :data:`RESCAN_INTERVAL`, which is
-        what an explicit refresh key asks for. Without either, the roots are
-        walked on the first call and then every interval, so a repo cloned or
-        deleted while a dashboard is open is picked up.
+        what an explicit refresh key asks for. Without either, the repo list is
+        taken on the first call and then every interval, so a repo cloned or
+        deleted while a dashboard is open is picked up. Only the first call may
+        take the list another process stored; every later one walks.
 
         The remote reading is re-derived against the local refs here, never
         re-fetched: a pull has to clear the behind marker on the next poll
         rather than at the end of the network interval.
+
+        The three readers run at once. None of them reads another's answer,
+        and each spends its time waiting on git subprocesses, so the tick
+        costs the slowest of the three rather than their sum.
         """
         moment = time.time() if now is None else now
-        if rescan or self._due_for_scan(moment):
+        if rescan:
             self.rescan(now=moment)
-        states = self._poller.poll(self._repos, now=now, force=force)
-        self._remote.refresh_local(self._repos)
-        by_path = {repo.path: repo for repo in self._repos}
-        self._reader.prime(self._repos)
+        elif self._due_for_scan(moment):
+            self._scan(moment, stored=self._scanned_at is None)
+        repos = self._repos
+        with ThreadPoolExecutor(max_workers=_READERS) as pool:
+            states_at = pool.submit(self._poller.poll, repos, now=now, force=force)
+            local_at = pool.submit(self._remote.refresh_local, repos)
+            primed_at = pool.submit(self._reader.prime, repos)
+            states = states_at.result()
+            local_at.result()
+            primed_at.result()
         rows = [
             Row(
                 state=state,
-                moved_at=self._reader.latest(by_path[state.path]),
+                moved_at=self._reader.latest(self._by_path[state.path]),
                 remote=self._remote.cached(state.path),
             )
             for state in states
@@ -150,15 +202,15 @@ class Board:
         written inside ``remote_interval`` leaves nothing for the network to
         do. ``force`` skips that gate.
 
-        Walks the roots first when nothing has yet. The dashboard starts this
-        worker alongside its first poll, and without the walk it would read an
-        empty list and then sit out its whole interval before trying again.
+        Takes the repo list first when nothing has yet. The dashboard starts
+        this worker alongside its first poll, and without it the worker would
+        read an empty list and sit out its whole interval before trying again.
         """
         if not self.config.remote:
             return False
         moment = time.time() if now is None else now
         if not self._repos:
-            self.rescan(now=moment)
+            self._scan(moment, stored=self._scanned_at is None)
         primed = self._remote.prime(self._repos)
         return self._remote.read(self._repos, moment, force=force) or primed
 
@@ -175,6 +227,18 @@ class Board:
     ) -> list[Entry]:
         """Return the merged cross-repo activity feed, newest first."""
         return self._reader.feed(self._repos, since=since, limit=limit)
+
+    def entries(self, path: Path, *, limit: int) -> list[Entry]:
+        """Return one repo's reflog entries, newest first.
+
+        Kept apart from :meth:`activity` because a caller showing one repo
+        would otherwise merge and sort every watched repo's reflog to throw
+        all but one away. An unwatched path has no entries.
+        """
+        repo = self._by_path.get(path)
+        if repo is None:
+            return []
+        return self._reader.entries(repo)[:limit]
 
 
 def group_families(rows: Sequence[Row]) -> list[Row]:

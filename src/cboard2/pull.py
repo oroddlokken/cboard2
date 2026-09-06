@@ -9,6 +9,10 @@ reliable. GitHub's answer is best and cboard2 usually holds it already.
 ``refs/remotes/origin/HEAD`` is next, but it is written once at clone time and
 never refreshed, so a renamed default branch leaves it pointing at a ref that
 is gone — hence the repair step. ``main`` and ``master`` are the last resort.
+
+One :func:`pull_default` waits at most 420s: a 60s fetch, then a 180s checkout
+and a 180s pull. The other calls read local refs and answer in milliseconds.
+Callers pass ``on_step`` to hear which of the three is running.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,9 +28,22 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     type StepRunner = Callable[[Path, Sequence[str]], Step]
+    type StepReport = Callable[[str], None]
+    """Called with the name of the step about to run, on the calling thread."""
 
 PULL_TIMEOUT = 180.0
 """Seconds a single git call gets. A fetch is not a five-second operation."""
+
+FETCH_TIMEOUT = 60.0
+"""Seconds the fetch gets, ahead of the rest.
+
+The fetch is the step that waits on a host, and it is the first of three, so a
+near-hanging origin used to burn the full :data:`PULL_TIMEOUT` before the user
+saw anything at all.
+"""
+
+_STEP_TIMEOUTS = MappingProxyType({"fetch": FETCH_TIMEOUT})
+"""Git subcommands that get something other than :data:`PULL_TIMEOUT`."""
 
 CANDIDATE_BRANCHES = ("main", "master")
 """Tried in order when neither GitHub nor ``origin/HEAD`` names the branch."""
@@ -68,7 +86,7 @@ def run_step(root: Path, args: Sequence[str]) -> Step:
             ["git", "-C", str(root), *args],  # noqa: S607
             capture_output=True,
             text=True,
-            timeout=PULL_TIMEOUT,
+            timeout=_STEP_TIMEOUTS.get(args[0], PULL_TIMEOUT),
             check=False,
             env={**os.environ, **_PULL_ENV},
         )
@@ -88,15 +106,20 @@ def pull_default(
     *,
     default_branch: str | None = None,
     runner: StepRunner = run_step,
+    on_step: StepReport = lambda _step: None,
 ) -> Outcome:
     """Fetch, move to the default branch and pull, stopping at the first failure.
 
     ``default_branch`` is GitHub's answer where cboard2 has one, which skips
     the guessing entirely.
+
+    ``on_step`` is handed each step's name as it starts, so a caller waiting
+    minutes on a slow origin can say which of the three is holding.
     """
     if not runner(root, ("rev-parse", "--git-dir")).ok:
         return Outcome(ok=False, message="not a git repository")
 
+    on_step("fetching")
     fetched = runner(root, ("fetch", "--prune"))
     if not fetched.ok:
         return Outcome(ok=False, message=_reason("fetch failed", fetched))
@@ -108,11 +131,11 @@ def pull_default(
             message="no default branch found: no origin/HEAD, main or master",
         )
 
-    moved = _checkout(root, branch, runner)
+    moved = _checkout(root, branch, runner, on_step)
     if moved is not None:
         return moved
 
-    return _pull(root, branch, runner)
+    return _pull(root, branch, runner, on_step)
 
 
 def find_default_branch(root: Path, runner: StepRunner) -> str | None:
@@ -161,12 +184,18 @@ def _has_ref(root: Path, ref: str, runner: StepRunner) -> bool:
     return runner(root, ("show-ref", "--verify", "--quiet", ref)).ok
 
 
-def _checkout(root: Path, branch: str, runner: StepRunner) -> Outcome | None:
+def _checkout(
+    root: Path,
+    branch: str,
+    runner: StepRunner,
+    on_step: StepReport,
+) -> Outcome | None:
     """Move to ``branch``, or return the failure. None means nothing went wrong."""
     current = runner(root, ("symbolic-ref", "--short", "HEAD"))
     if current.ok and current.out.strip() == branch:
         return None
 
+    on_step(f"checking out {branch}")
     step = runner(root, ("checkout", branch))
     if not step.ok:
         return Outcome(
@@ -177,7 +206,12 @@ def _checkout(root: Path, branch: str, runner: StepRunner) -> Outcome | None:
     return None
 
 
-def _pull(root: Path, branch: str, runner: StepRunner) -> Outcome:
+def _pull(
+    root: Path,
+    branch: str,
+    runner: StepRunner,
+    on_step: StepReport,
+) -> Outcome:
     """Pull ``branch``, rebasing only when the tree is clean.
 
     A rebase needs a clean tree; a fast-forward does not, and only fails when
@@ -188,6 +222,7 @@ def _pull(root: Path, branch: str, runner: StepRunner) -> Outcome:
     before = _head_sha(root, runner)
     clean = runner(root, ("diff", "--quiet", "HEAD")).ok
     args = ("pull", "--rebase") if clean else ("pull", "--ff-only")
+    on_step(f"pulling {branch}")
     step = runner(root, args)
 
     if not step.ok:

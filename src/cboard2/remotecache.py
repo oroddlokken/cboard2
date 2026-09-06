@@ -6,7 +6,8 @@ Only what the network told us is stored, keyed by ``owner/name`` on GitHub and
 by the origin URL elsewhere: the default branch and its tip, the tip of each
 branch the read asked about by name, the merged pull request that came off each
 of those branches, and the pull requests the user authored or was asked to
-review with each one's checks state. The two behind markers are
+review with each one's checks state, and whether either search hit its
+result limit. The two behind markers are
 deliberately absent — they are derived from the local refs, so a cached copy
 would keep reporting ``behind main`` after a pull.
 :meth:`cboard2.remote.RemoteReader.refresh_local` recomputes them on load.
@@ -24,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from cboard2.remote import CHECKS_UNKNOWN, Cached, MergedPR, PullRequest
+from cboard2.remote import CHECKS_UNKNOWN, Cached, MergedPR, PullRequest, as_dict
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 _ENV_CACHE_PATH = "CBOARD2_CACHE"
 """Env var pointing at an alternate cache file, for tests and power users."""
 
-VERSION = 4
+VERSION = 5
 """Schema version. A file written by another version is read as a cold cache.
 
 Bumped whenever a stored field is added or changes meaning, so a file from an
@@ -84,8 +85,8 @@ def load(path: Path) -> Cached | None:
     prs: dict[str, tuple[PullRequest, ...]] = {}
     review: dict[str, tuple[PullRequest, ...]] = {}
     merged: dict[str, Mapping[str, MergedPR]] = {}
-    for key, entry in _as_dict(body.get("repos")).items():
-        fields = _as_dict(entry)
+    for key, entry in as_dict(body.get("repos")).items():
+        fields = as_dict(entry)
         branch = fields.get("default_branch")
         sha = fields.get("default_sha")
         if isinstance(branch, str) and isinstance(sha, str):
@@ -111,6 +112,8 @@ def load(path: Path) -> Cached | None:
         prs_known=body.get("prs_known") is True,
         review_prs=review,
         review_prs_known=body.get("review_prs_known") is True,
+        prs_truncated=body.get("prs_truncated") is True,
+        review_prs_truncated=body.get("review_prs_truncated") is True,
         merged=merged,
     )
 
@@ -129,6 +132,8 @@ def save(path: Path, cached: Cached) -> bool:
         "read_at": cached.read_at,
         "prs_known": cached.prs_known,
         "review_prs_known": cached.review_prs_known,
+        "prs_truncated": cached.prs_truncated,
+        "review_prs_truncated": cached.review_prs_truncated,
         "repos": {
             key: _entry(cached, key)
             for key in sorted(
@@ -203,8 +208,8 @@ def _stored_merged(pr: MergedPR) -> dict[str, object]:
 def _merged(value: object) -> dict[str, MergedPR]:
     """Read one remote's stored merged PRs, skipping any entry missing a number."""
     found: dict[str, MergedPR] = {}
-    for branch, entry in _as_dict(value).items():
-        fields = _as_dict(entry)
+    for branch, entry in as_dict(value).items():
+        fields = as_dict(entry)
         number = fields.get("number")
         if not branch or not isinstance(number, int) or isinstance(number, bool):
             continue
@@ -224,7 +229,7 @@ def _tips(value: object) -> dict[str, str]:
     """Read one remote's stored branch tips, skipping anything not two strings."""
     return {
         name: sha
-        for name, sha in _as_dict(value).items()
+        for name, sha in as_dict(value).items()
         if isinstance(sha, str) and name
     }
 
@@ -235,7 +240,7 @@ def _requests(value: object) -> tuple[PullRequest, ...]:
         return ()
     found: list[PullRequest] = []
     for item in cast("list[object]", value):
-        fields = _as_dict(item)
+        fields = as_dict(item)
         number = fields.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
             continue
@@ -254,13 +259,6 @@ def _requests(value: object) -> tuple[PullRequest, ...]:
             ),
         )
     return tuple(found)
-
-
-def _as_dict(value: object) -> dict[str, object]:
-    """Return ``value`` as a string-keyed mapping, or an empty one."""
-    if not isinstance(value, dict):
-        return {}
-    return cast("dict[str, object]", value)
 
 
 def _text(value: object) -> str:

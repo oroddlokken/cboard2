@@ -2,8 +2,13 @@
 
 There is no hook and no registration step: a clone appears on the dashboard
 because it is on disk under a root. Walking ``~`` to depth 4 finds 109 repos in
-0.3s on the author's machine, so this runs at startup rather than being cached
-as the source of truth.
+0.3s on the author's machine, so the walk is the source of truth and the cache
+below is only a way to skip repeating it.
+
+:func:`save_repos` and :func:`load_repos` carry the last walk's result between
+processes. A one-shot ``cboard ls`` runs once per shell prompt and would
+otherwise pay the walk every time. The stored list is keyed by the watch list
+that produced it and expires, so a clone or a deletion is still picked up.
 
 A linked worktree gets its own row: it has its own HEAD, branch and dirty tree.
 It carries the git directory of the repo it belongs to, so the row can name
@@ -13,15 +18,23 @@ per worktree.
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Collection, Iterator, Sequence
 
     from cboard2.config import Config
+
+_ENV_REPO_CACHE = "CBOARD2_REPO_CACHE"
+"""Env var pointing at an alternate repo-list cache file, for tests."""
+
+CACHE_VERSION = 1
+"""Schema version. A file written by another version is read as a cold cache."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,23 +68,31 @@ def discover(config: Config) -> list[Repo]:
     ``worktrees`` is off, each repo's linked worktrees are added too, including
     the ones kept inside the repo where the walk would never reach them.
     """
+    dormant = frozenset(config.dormant)
     found: dict[Path, Repo] = {}
     for root in config.roots:
         for path in _walk(root, config.max_depth):
-            _add(found, path, config)
+            _add(found, path, dormant)
 
     if config.worktrees:
         for repo in list(found.values()):
             if repo.main_git_dir is None:
                 for tree in linked_worktrees(repo.path):
-                    _add(found, tree, config)
+                    _add(found, tree, dormant)
 
     return sorted(found.values(), key=lambda repo: repo.path)
 
 
-def is_dormant(path: Path, dormant: Iterable[Path]) -> bool:
-    """Return True when ``path`` is listed dormant or sits under a listed path."""
-    return any(path.is_relative_to(entry) for entry in dormant)
+def is_dormant(path: Path, dormant: Collection[Path]) -> bool:
+    """Return True when ``path`` is listed dormant or sits under a listed path.
+
+    Looks up ``path`` and its ancestors rather than testing every listed path,
+    so the cost follows the depth of the repo and not the length of the list.
+    Both are lexical comparisons, so the two agree entry for entry.
+    """
+    if not dormant:
+        return False
+    return path in dormant or any(parent in dormant for parent in path.parents)
 
 
 def git_dir(root: Path) -> Path:
@@ -144,14 +165,14 @@ def linked_worktrees(root: Path) -> list[Path]:
     return found
 
 
-def _add(found: dict[Path, Repo], path: Path, config: Config) -> None:
+def _add(found: dict[Path, Repo], path: Path, dormant: Collection[Path]) -> None:
     """Record ``path`` as a repo, keeping the entry already there."""
     if path in found:
         return
     found[path] = Repo(
         path=path,
         name=path.name,
-        dormant=is_dormant(path, config.dormant),
+        dormant=is_dormant(path, dormant),
         main_git_dir=main_git_dir(path),
     )
 
@@ -199,3 +220,168 @@ def _subdirs(directory: Path) -> list[Path]:
             ]
     except OSError:
         return []
+
+
+def repo_cache_path() -> Path:
+    """Return the repo-list cache file path.
+
+    ``CBOARD2_REPO_CACHE`` wins, then ``XDG_CACHE_HOME``, then ``~/.cache`` —
+    the order :func:`cboard2.remotecache.cache_path` uses for its own file.
+    """
+    override = os.environ.get(_ENV_REPO_CACHE)
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".cache"
+    return base / "cboard2" / "repos.json"
+
+
+def load_repos(
+    path: Path,
+    config: Config,
+    moment: float,
+    ttl: float,
+) -> list[Repo] | None:
+    """Return the stored repo list, or None when a walk is owed.
+
+    None covers a missing, empty, truncated, mistyped or wrong-version file, a
+    file written under a different watch list, and one older than ``ttl``
+    seconds or stamped ahead of ``moment``. Nothing here raises: a bad cache
+    costs a walk, not a traceback out of a poll.
+    """
+    body = _read(path)
+    if body is None:
+        return None
+    if body.get("version") != CACHE_VERSION or body.get("watching") != _watching(
+        config,
+    ):
+        return None
+    scanned_at = body.get("scanned_at")
+    if not isinstance(scanned_at, (int, float)) or isinstance(scanned_at, bool):
+        return None
+    age = moment - float(scanned_at)
+    if age < 0 or age >= ttl:
+        return None
+    return _stored_repos(body.get("repos"))
+
+
+def save_repos(
+    path: Path,
+    config: Config,
+    repos: Sequence[Repo],
+    moment: float,
+) -> bool:
+    """Write the repo list and report whether it landed.
+
+    The write goes to a temp file in the same directory and is moved into
+    place, so a process reading the file never sees a half-written one. An
+    unwritable directory returns False rather than raising: the caller already
+    has the list, and losing the cache costs the next process one walk.
+    """
+    body = {
+        "version": CACHE_VERSION,
+        "scanned_at": moment,
+        "watching": _watching(config),
+        "repos": [_stored(repo) for repo in repos],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=path.name,
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(body, handle, indent=2)
+            temp = Path(handle.name)
+    except OSError:
+        return False
+
+    try:
+        os.replace(temp, path)  # noqa: PTH105 — Path has no atomic-replace method
+    except OSError:
+        temp.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _read(path: Path) -> dict[str, object] | None:
+    """Return the file as a mapping, or None when there is nothing usable in it."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return cast("dict[str, object]", payload)
+
+
+def _watching(config: Config) -> dict[str, object]:
+    """Return the config keys that decide which repos a walk finds.
+
+    A cache written under different keys answers a different question, so it
+    is discarded rather than filtered. ``dormant`` is in here because it is
+    stored per repo; the poll intervals are not, because they never are.
+    """
+    return {
+        "roots": sorted(str(root) for root in config.roots),
+        "max_depth": config.max_depth,
+        "dormant": sorted(str(entry) for entry in config.dormant),
+        "worktrees": config.worktrees,
+    }
+
+
+def _stored(repo: Repo) -> dict[str, object]:
+    """Return one repo as the fields the file carries."""
+    return {
+        "path": str(repo.path),
+        "name": repo.name,
+        "dormant": repo.dormant,
+        "main_git_dir": None if repo.main_git_dir is None else str(repo.main_git_dir),
+    }
+
+
+def _stored_repos(value: object) -> list[Repo] | None:
+    """Read the stored repos, or None when any entry is unusable.
+
+    One bad entry discards the whole list: a half-read list would drop a repo
+    from the dashboard until the next walk, which looks like a deletion.
+    """
+    if not isinstance(value, list):
+        return None
+    found: list[Repo] = []
+    for item in cast("list[object]", value):
+        repo = _stored_repo(item)
+        if repo is None:
+            return None
+        found.append(repo)
+    return found
+
+
+def _stored_repo(item: object) -> Repo | None:
+    """Read one stored repo, or None when a field is missing or mistyped."""
+    if not isinstance(item, dict):
+        return None
+    fields = cast("dict[str, object]", item)
+    path = fields.get("path")
+    name = fields.get("name")
+    dormant = fields.get("dormant")
+    main = fields.get("main_git_dir")
+    if not isinstance(path, str) or not isinstance(name, str):
+        return None
+    if not isinstance(dormant, bool):
+        return None
+    if main is not None and not isinstance(main, str):
+        return None
+    return Repo(
+        path=Path(path),
+        name=name,
+        dormant=dormant,
+        main_git_dir=None if main is None else Path(main),
+    )

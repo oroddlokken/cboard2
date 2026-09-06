@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from cboard2.constants import ACTIVITY_MAX_WORKERS
 from cboard2.discovery import git_dir
 from cboard2.gitstate import run_git
 
@@ -32,9 +33,6 @@ if TYPE_CHECKING:
 
 MAX_ENTRIES_PER_REPO = 200
 """Reflog entries read per repo. A repo with more has older ones left unread."""
-
-DEFAULT_MAX_WORKERS = 16
-"""Concurrent reflog reads during one :meth:`ActivityReader.prime` call."""
 
 _REFLOG_ARGS = (
     "reflog",
@@ -76,20 +74,21 @@ class Branch:
 class ActivityReader:
     """Reads reflogs, skipping any repo whose ``logs/HEAD`` has not moved.
 
-    Holds the last entries and the mtime they were read at, per repo, so a
-    quiet repo costs one ``stat`` per tick instead of a git process.
+    Holds each repo's entries with the mtime they were read at, as one pair, so
+    a quiet repo costs one ``stat`` per tick instead of a git process. The pair
+    is one dict value because the poll thread and the UI thread both reach this
+    cache, and two dicts can be written out of step.
     """
 
     def __init__(
         self,
         runner: GitRunner = run_git,
         *,
-        max_workers: int = DEFAULT_MAX_WORKERS,
+        max_workers: int = ACTIVITY_MAX_WORKERS,
     ) -> None:
         self._runner = runner
         self._max_workers = max_workers
-        self._entries: dict[Path, list[Entry]] = {}
-        self._read_at: dict[Path, float] = {}
+        self._cache: dict[Path, tuple[float, list[Entry]]] = {}
 
     def prime(self, repos: Sequence[Repo]) -> None:
         """Read the reflogs that moved since last time, all at once.
@@ -111,8 +110,7 @@ class ActivityReader:
             results = list(pool.map(read, stale))
 
         for repo, mtime, entries in results:
-            self._entries[repo.path] = entries
-            self._read_at[repo.path] = mtime
+            self._cache[repo.path] = (mtime, entries)
 
     def _staleness(self, repo: Repo) -> tuple[Repo, float] | None:
         """Return ``repo`` with its ``logs/HEAD`` mtime, or None if it is current.
@@ -120,7 +118,8 @@ class ActivityReader:
         None also covers a repo with no reflog at all, which has nothing to read.
         """
         mtime = log_mtime(repo.path)
-        if mtime is None or self._read_at.get(repo.path) == mtime:
+        cached = self._cache.get(repo.path)
+        if mtime is None or (cached is not None and cached[0] == mtime):
             return None
         return repo, mtime
 
@@ -129,12 +128,12 @@ class ActivityReader:
         mtime = log_mtime(repo.path)
         if mtime is None:
             return []
-        if self._read_at.get(repo.path) == mtime:
-            return self._entries[repo.path]
+        cached = self._cache.get(repo.path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
 
         entries = read_reflog(repo, self._runner)
-        self._entries[repo.path] = entries
-        self._read_at[repo.path] = mtime
+        self._cache[repo.path] = (mtime, entries)
         return entries
 
     def latest(self, repo: Repo) -> float | None:
@@ -165,9 +164,8 @@ class ActivityReader:
     def forget_absent(self, repos: Iterable[Repo]) -> None:
         """Drop cached reflogs for repos no longer in the watch list."""
         live = {repo.path for repo in repos}
-        for cache in (self._entries, self._read_at):
-            for path in [key for key in cache if key not in live]:
-                del cache[path]
+        for path in [key for key in self._cache if key not in live]:
+            del self._cache[path]
 
 
 def read_reflog(repo: Repo, runner: GitRunner = run_git) -> list[Entry]:

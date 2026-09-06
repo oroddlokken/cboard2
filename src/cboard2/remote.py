@@ -17,7 +17,7 @@ author's machine: 66 repos in one query took 4.4s, against 1.7s per repo for
 its own slow interval rather than the 2s poll tick.
 
 The searches run before the query because the query needs their PR numbers.
-They were already sequential, so ordering them costs nothing.
+They run alongside the three local git batches, which need nothing from them.
 
 A branch name reaches that query as a GraphQL variable, never as text spliced
 into it. Git allows a double quote in a branch name, and the query is a string.
@@ -50,12 +50,13 @@ import os
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
+from cboard2.constants import REMOTE_MAX_WORKERS
 from cboard2.gitstate import run_git
 
 if TYPE_CHECKING:
@@ -68,6 +69,13 @@ if TYPE_CHECKING:
     type GhRunner = Callable[[Sequence[str]], str | None]
     type CacheLoader = Callable[[], Cached | None]
     type CacheSaver = Callable[[Cached], bool]
+    type _Patch = Callable[[RemoteState], RemoteState]
+    """A pending edit to one repo's state, carrying fields rather than a whole one.
+
+    Applied to whatever state is live when it lands, so a network read that
+    finished while the patch was being computed keeps its answers.
+    """
+
     type _Chunk = tuple[
         dict[str, tuple[str, str]],
         dict[str, dict[str, str]],
@@ -94,8 +102,31 @@ Every repo's default branch moves on someone else's schedule, so reading it
 faster than this buys nothing.
 """
 
-DEFAULT_MAX_WORKERS = 8
-"""Concurrent calls while resolving slugs and local refs."""
+PROBE_TIMEOUT = 5.0
+"""Seconds a batch of ls-remote probes gets before the stragglers are dropped.
+
+One unreachable origin would otherwise hold the batch for the full
+:data:`LS_REMOTE_TIMEOUT`, and its repo reads unknown either way.
+"""
+
+ANCESTRY_LIMIT = 512
+"""Memoized merge-base answers kept, oldest dropped first.
+
+One entry per (family, local sha, remote sha). A repo that stays behind and
+keeps advancing adds one per read, so a dashboard left open for days needs a
+ceiling here.
+"""
+
+_READ_PHASES = 4
+"""Phases of a read that run at once: two local git batches and two searches."""
+
+REF_STAT_CAP = 400
+"""Ref files a family's staleness check may stat before it gives up.
+
+A family over the cap is read on every poll instead of gated. A missed ref
+change would leave a behind marker up that the user has already pulled away,
+which costs more than the subprocess the gate saves.
+"""
 
 BATCH_SIZE = 30
 """Repos per GraphQL query, run as one batch across the pool."""
@@ -271,6 +302,16 @@ class RemoteState:
     """Whether the review search succeeded. Separate from ``prs_known``: the two
     searches fail separately, and an empty result is a real answer for either."""
 
+    prs_truncated: bool = False
+    """Whether the authored search hit :data:`PR_SEARCH_LIMIT` and dropped PRs.
+
+    The result count is the only signal gh gives, so a user with exactly that
+    many open PRs reads as truncated too.
+    """
+
+    review_prs_truncated: bool = False
+    """The same for the search that found the PRs waiting on the user's review."""
+
     behind_default: bool = False
     """Whether the remote tip is missing from the local default branch.
 
@@ -366,6 +407,14 @@ class Cached:
     review_prs_known: bool = False
     """The same pair for the PRs waiting on the user's review."""
 
+    prs_truncated: bool = False
+    review_prs_truncated: bool = False
+    """Whether each search hit :data:`PR_SEARCH_LIMIT`.
+
+    Stored so a restart inside the read interval keeps telling the user their
+    list is short, rather than showing 100 PRs as if they were all of them.
+    """
+
     merged: Mapping[str, Mapping[str, MergedPR]] = _NO_MERGED
     """Slug to the merged PR of each branch the read asked about by name.
 
@@ -440,6 +489,98 @@ def leaders(repos: Sequence[Repo]) -> list[Repo]:
         seen.add(repo.family)
         chosen.append(repo)
     return chosen
+
+
+def ref_mark(family: Path) -> tuple[float, int, float, float] | None:
+    """Return a fingerprint of everything the two local git batches read.
+
+    ``for-each-ref refs/heads`` answers from the loose refs and ``packed-refs``;
+    ``worktree list`` answers from the worktree directory and each HEAD. Two
+    marks that compare equal mean neither batch can have a new answer, so the
+    poll reuses the last one.
+
+    None means the caller has to run both batches: the family holds more ref
+    files than :data:`REF_STAT_CAP`, or its git directory cannot be read and
+    nothing here would notice the refs moving.
+    """
+    if not os.path.isdir(family):  # noqa: PTH112 — Path is a type-check import
+        return None
+    found = _newest_ref(family / "refs" / "heads")
+    if found is None:
+        return None
+    newest, count = found
+    return newest, count, _mtime(family / "packed-refs"), _newest_head(family)
+
+
+def _mtime(path: Path | str) -> float:
+    """Return ``path``'s modification time, or -1 when it does not exist."""
+    try:
+        return os.stat(path).st_mtime  # noqa: PTH116 — str and Path, no Path build
+    except OSError:
+        return -1.0
+
+
+def _newest_ref(root: Path) -> tuple[float, int] | None:
+    """Return the newest mtime and the file count under ``root``.
+
+    A ref write bumps its file's mtime to now, and a branch created or deleted
+    moves the count, so the pair moves whenever ``for-each-ref`` gains a new
+    answer. Returns None past :data:`REF_STAT_CAP` rather than walking a repo
+    with thousands of branches on every 2s poll.
+    """
+    newest = -1.0
+    count = 0
+    stack = [str(root)]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            count += 1
+            if count > REF_STAT_CAP:
+                return None
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(entry.path)
+            else:
+                newest = max(newest, _mtime(entry.path))
+    return newest, count
+
+
+def _newest_head(family: Path) -> float:
+    """Return the newest HEAD mtime across the repo and its linked worktrees.
+
+    A checkout inside a worktree writes ``worktrees/<name>/HEAD`` and leaves
+    the directory above it alone, so the directory's own mtime would miss it.
+    """
+    newest = _mtime(family / "HEAD")
+    worktrees = family / "worktrees"
+    newest = max(newest, _mtime(worktrees))
+    try:
+        entries = list(os.scandir(worktrees))
+    except OSError:
+        return newest
+    for entry in entries:
+        newest = max(newest, _mtime(os.path.join(entry.path, "HEAD")))  # noqa: PTH118
+    return newest
+
+
+def branches_at(
+    repos: Sequence[Repo],
+    listings: Mapping[Path, Mapping[str, str]],
+) -> dict[Path, str]:
+    """Return the branch checked out at each path, from its family's listing.
+
+    Git prints resolved paths, so a row reached through a symlink is looked up
+    under both spellings.
+    """
+    found: dict[Path, str] = {}
+    for repo in repos:
+        listed = listings.get(repo.family, {})
+        branch = listed.get(str(repo.path)) or listed.get(str(repo.path.resolve()))
+        if branch is not None:
+            found[repo.path] = branch
+    return found
 
 
 def parse_slug(url: str) -> str | None:
@@ -645,16 +786,16 @@ def parse_defaults(text: str, slugs: Sequence[str]) -> dict[str, tuple[str, str]
     A slug whose entry is null or incomplete is left out, so the caller reports
     it unknown instead of current.
     """
-    payload = _as_dict(_load(text))
-    data = _as_dict(payload.get("data"))
+    payload = as_dict(_load(text))
+    data = as_dict(payload.get("data"))
     if not data:
         return {}
 
     found: dict[str, tuple[str, str]] = {}
     for index, slug in enumerate(slugs):
-        ref = _as_dict(_as_dict(data.get(f"r{index}")).get("defaultBranchRef"))
+        ref = as_dict(as_dict(data.get(f"r{index}")).get("defaultBranchRef"))
         name = ref.get("name")
-        oid = _as_dict(ref.get("target")).get("oid")
+        oid = as_dict(ref.get("target")).get("oid")
         if isinstance(name, str) and isinstance(oid, str):
             found[slug] = (name, oid)
     return found
@@ -670,16 +811,16 @@ def parse_branch_tips(
     A branch the origin does not have resolves to null and is left out, which
     the caller reads as no branch to be behind of rather than as no answer.
     """
-    payload = _as_dict(_load(text))
-    data = _as_dict(payload.get("data"))
+    payload = as_dict(_load(text))
+    data = as_dict(payload.get("data"))
     if not data:
         return {}
 
     aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
     found: dict[str, dict[str, str]] = {}
     for index, (slug, branch) in enumerate(pairs):
-        repo = _as_dict(data.get(aliases.get(slug, "")))
-        oid = _as_dict(_as_dict(repo.get(f"b{index}")).get("target")).get("oid")
+        repo = as_dict(data.get(aliases.get(slug, "")))
+        oid = as_dict(as_dict(repo.get(f"b{index}")).get("target")).get("oid")
         if isinstance(oid, str):
             found.setdefault(slug, {})[branch] = oid
     return found
@@ -695,16 +836,16 @@ def parse_merged_prs(
     The query asks for the most recently updated one, so a branch merged more
     than once reports its latest. A branch with none is left out.
     """
-    payload = _as_dict(_load(text))
-    data = _as_dict(payload.get("data"))
+    payload = as_dict(_load(text))
+    data = as_dict(payload.get("data"))
     if not data:
         return {}
 
     aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
     found: dict[str, dict[str, MergedPR]] = {}
     for index, (slug, branch) in enumerate(pairs):
-        repo = _as_dict(data.get(aliases.get(slug, "")))
-        merged = _merged_pr(_as_dict(repo.get(f"m{index}")))
+        repo = as_dict(data.get(aliases.get(slug, "")))
+        merged = _merged_pr(as_dict(repo.get(f"m{index}")))
         if merged is not None:
             found.setdefault(slug, {})[branch] = merged
     return found
@@ -715,7 +856,7 @@ def _merged_pr(entry: dict[str, object]) -> MergedPR | None:
     nodes = entry.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         return None
-    node = _as_dict(cast("list[object]", nodes)[0])
+    node = as_dict(cast("list[object]", nodes)[0])
     number = node.get("number")
     if not isinstance(number, int) or isinstance(number, bool):
         return None
@@ -740,18 +881,18 @@ def parse_check_states(
     :data:`CHECKS_UNKNOWN`; one whose head commit carries no rollup reads
     :data:`CHECKS_NONE`, which is the answer that no checks run here.
     """
-    payload = _as_dict(_load(text))
-    data = _as_dict(payload.get("data"))
+    payload = as_dict(_load(text))
+    data = as_dict(payload.get("data"))
     if not data:
         return {}
 
     aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
     found: dict[str, dict[int, str]] = {}
     for index, (slug, number) in enumerate(checks):
-        repo = _as_dict(data.get(aliases.get(slug, "")))
+        repo = as_dict(data.get(aliases.get(slug, "")))
         if f"c{index}" not in repo:
             continue
-        entry = _as_dict(repo.get(f"c{index}"))
+        entry = as_dict(repo.get(f"c{index}"))
         if not entry:
             continue
         found.setdefault(slug, {})[number] = _rollup_state(entry)
@@ -760,10 +901,10 @@ def parse_check_states(
 
 def _rollup_state(pull_request: dict[str, object]) -> str:
     """Read one ``pullRequest`` entry's checks rollup into a ``CHECKS_*`` value."""
-    nodes = _as_dict(pull_request.get("commits")).get("nodes")
+    nodes = as_dict(pull_request.get("commits")).get("nodes")
     if not isinstance(nodes, list) or not nodes:
         return CHECKS_NONE
-    commit = _as_dict(_as_dict(cast("list[object]", nodes)[0]).get("commit"))
+    commit = as_dict(as_dict(cast("list[object]", nodes)[0]).get("commit"))
     rollup = commit.get("statusCheckRollup")
     if not isinstance(rollup, dict):
         return CHECKS_NONE
@@ -820,7 +961,7 @@ def parse_prs(text: str) -> dict[str, tuple[PullRequest, ...]] | None:
 
     grouped: dict[str, list[PullRequest]] = {}
     for item in cast("list[object]", payload):
-        entry = _pull_request(_as_dict(item))
+        entry = _pull_request(as_dict(item))
         if entry is None:
             continue
         slug, request = entry
@@ -831,10 +972,22 @@ def parse_prs(text: str) -> dict[str, tuple[PullRequest, ...]] | None:
     }
 
 
+def search_at_limit(text: str) -> bool:
+    """Return True when a search came back with :data:`PR_SEARCH_LIMIT` results.
+
+    That count is the whole signal: gh stops at the limit and says nothing
+    about the PRs that did not fit.
+    """
+    payload = _load(text)
+    if not isinstance(payload, list):
+        return False
+    return len(cast("list[object]", payload)) >= PR_SEARCH_LIMIT
+
+
 def _pull_request(item: dict[str, object]) -> tuple[str, PullRequest] | None:
     """Read one search result, or return None when a field it needs is missing."""
     number = item.get("number")
-    slug = _as_dict(item.get("repository")).get("nameWithOwner")
+    slug = as_dict(item.get("repository")).get("nameWithOwner")
     if not isinstance(number, int) or not isinstance(slug, str):
         return None
     title = item.get("title")
@@ -856,7 +1009,7 @@ def _load(text: str) -> object:
         return None
 
 
-def _as_dict(value: object) -> dict[str, object]:
+def as_dict(value: object) -> dict[str, object]:
     """Return ``value`` as a string-keyed mapping, or an empty one.
 
     Every field below comes out of ``json.loads`` as ``object``, and a mapping
@@ -868,13 +1021,80 @@ def _as_dict(value: object) -> dict[str, object]:
 
 
 def _timestamp(value: object) -> float | None:
-    """Convert an ISO-8601 field from gh into a unix time, or None."""
+    """Convert an ISO-8601 field from gh into a unix time, or None.
+
+    A string carrying no UTC offset is rejected. Read as host-local it would
+    store an epoch whose zone nothing records, and the cache it lands in is
+    read back by a process that cannot tell the two readings apart.
+    """
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value).timestamp()
+        moment = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if moment.tzinfo is None:
+        return None
+    return moment.timestamp()
+
+
+def _named(url: str) -> _Patch:
+    """Return a patch naming ``url`` as the origin of a state that has none yet."""
+
+    def patch(state: RemoteState) -> RemoteState:
+        if state.origin is not None:
+            return state
+        return replace(state, origin=url)
+
+    return patch
+
+
+def _markers(*, behind_default: bool, behind_branch: bool) -> _Patch:
+    """Return a patch carrying both recomputed behind markers."""
+
+    def patch(state: RemoteState) -> RemoteState:
+        return replace(
+            state,
+            behind_default=behind_default,
+            behind_branch=behind_branch,
+        )
+
+    return patch
+
+
+def _moved(*, behind_default: bool, branch: str | None) -> _Patch:
+    """Return a patch for a checkout that moved since the read that answered for it.
+
+    Every branch field goes with it: they were about the branch that was here
+    then, and the next network read is what fills the new one in.
+    """
+
+    def patch(state: RemoteState) -> RemoteState:
+        return replace(
+            state,
+            behind_default=behind_default,
+            branch=branch,
+            branch_remote=None,
+            branch_sha=None,
+            branch_known=False,
+            behind_branch=False,
+            branch_merged_pr=None,
+        )
+
+    return patch
+
+
+def _trim(memo: dict[tuple[Path, str, str], bool]) -> None:
+    """Drop the oldest entries once ``memo`` is over :data:`ANCESTRY_LIMIT`.
+
+    Insertion order, so what goes is what was added longest ago. A repo still
+    being polled re-runs one merge-base and is back in.
+    """
+    excess = len(memo) - ANCESTRY_LIMIT
+    if excess <= 0:
+        return
+    for key in list(memo)[:excess]:
+        memo.pop(key, None)
 
 
 class RemoteReader:
@@ -891,7 +1111,7 @@ class RemoteReader:
         self,
         interval: float = DEFAULT_REMOTE_INTERVAL,
         *,
-        max_workers: int = DEFAULT_MAX_WORKERS,
+        max_workers: int = REMOTE_MAX_WORKERS,
         runner: GitRunner = run_git,
         ls_remote: GitRunner = run_ls_remote,
         gh: GhRunner = run_gh,
@@ -910,6 +1130,8 @@ class RemoteReader:
         self._read_at: float | None = None
         self._ancestry: dict[tuple[Path, str, str], bool] = {}
         self._origin_urls: dict[Path, str | None] = {}
+        self._ref_marks: dict[Path, tuple[float, int, float, float]] = {}
+        self._ref_reads: dict[Path, tuple[str, dict[str, str]]] = {}
 
     @property
     def read_at(self) -> float | None:
@@ -932,6 +1154,10 @@ class RemoteReader:
         The timestamp comes from the file, so :meth:`due` treats a cache
         written a minute ago as a read a minute ago and skips the network.
         Without a loader, or with nothing usable on disk, this is a no-op.
+
+        The behind markers are derived from the branch tips and worktree
+        listing read here, not by calling :meth:`refresh_local`, which would
+        run both subprocess batches a second time.
         """
         if self._primed or self._load is None:
             return False
@@ -941,7 +1167,8 @@ class RemoteReader:
             return False
 
         origins = self._origins(repos)
-        checkouts = self._checkouts(repos)
+        lines, listings = self._local_refs(repos)
+        checkouts = branches_at(repos, listings)
         self._rebuild(
             repos,
             origins=origins,
@@ -950,11 +1177,13 @@ class RemoteReader:
             merged=cached.merged,
             prs=cached.prs if cached.prs_known else None,
             review=cached.review_prs if cached.review_prs_known else None,
+            prs_truncated=cached.prs_truncated,
+            review_truncated=cached.review_prs_truncated,
             checkouts=checkouts,
-            targets=self._targets(repos, checkouts, self._ref_lines(repos)),
+            targets=self._targets(repos, checkouts, lines),
         )
         self._read_at = cached.read_at
-        self.refresh_local(repos)
+        self._fold(self._apply(self._covered(repos), lines, checkouts))
         return True
 
     def read(
@@ -972,25 +1201,35 @@ class RemoteReader:
         Finishes by calling :meth:`refresh_local`, so the states this leaves
         behind are already current against the tree.
 
-        The two PR searches run first, because the query that fills in each
-        PR's checks state needs their numbers to ask about.
+        The two PR searches run alongside the three local git batches, and the
+        GraphQL query alongside the ls-remote probes: no phase in either group
+        reads another's answer. The searches still finish before the query,
+        which needs their PR numbers to ask about the checks.
         """
         if not (force or self.due(now)):
             return False
 
-        origins = self._origins(repos)
-        checkouts = self._checkouts(repos)
-        lines = self._ref_lines(repos)
+        with ThreadPoolExecutor(max_workers=_READ_PHASES) as pool:
+            origins_at = pool.submit(self._origins, repos)
+            refs_at = pool.submit(self._local_refs, repos)
+            prs_at = pool.submit(self._prs, _PR_SEARCH_ARGS)
+            review_at = pool.submit(self._prs, _REVIEW_SEARCH_ARGS)
+            origins = origins_at.result()
+            lines, listings = refs_at.result()
+            prs, prs_truncated = prs_at.result()
+            review, review_truncated = review_at.result()
+        checkouts = branches_at(repos, listings)
+
         targets = self._targets(repos, checkouts, lines)
         wanted = self._wanted(repos, origins, targets)
-
-        prs = self._prs(_PR_SEARCH_ARGS)
-        review = self._prs(_REVIEW_SEARCH_ARGS)
         slugs = github_slugs(origins.values())
         asked = check_lookups(slugs, prs, review)
 
-        defaults, tips, states, merged = self._defaults(slugs, wanted, asked)
-        probed, probed_tips = self._probe(repos, origins, wanted)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            query_at = pool.submit(self._defaults, slugs, wanted, asked)
+            probe_at = pool.submit(self._probe, repos, origins, wanted)
+            defaults, tips, states, merged = query_at.result()
+            probed, probed_tips = probe_at.result()
         defaults.update(probed)
         tips.update(probed_tips)
         prs = None if prs is None else with_checks(prs, states)
@@ -1004,12 +1243,23 @@ class RemoteReader:
             merged=merged,
             prs=prs,
             review=review,
+            prs_truncated=prs_truncated,
+            review_truncated=review_truncated,
             checkouts=checkouts,
             targets=targets,
         )
         self._read_at = now
-        self._apply(self._covered(repos), lines, checkouts)
-        self._store(defaults, tips, merged, prs=prs, review=review, now=now)
+        self._fold(self._apply(self._covered(repos), lines, checkouts))
+        self._store(
+            defaults,
+            tips,
+            merged,
+            prs=prs,
+            review=review,
+            prs_truncated=prs_truncated,
+            review_truncated=review_truncated,
+            now=now,
+        )
         return True
 
     def _rebuild(
@@ -1022,6 +1272,8 @@ class RemoteReader:
         merged: Mapping[str, Mapping[str, MergedPR]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
+        prs_truncated: bool,
+        review_truncated: bool,
         checkouts: Mapping[Path, str],
         targets: Mapping[Path, str],
     ) -> None:
@@ -1034,6 +1286,8 @@ class RemoteReader:
                 merged=merged,
                 prs=prs,
                 review=review,
+                prs_truncated=prs_truncated,
+                review_truncated=review_truncated,
                 branch=checkouts.get(repo.path),
                 target=targets.get(repo.path),
             )
@@ -1048,6 +1302,8 @@ class RemoteReader:
         *,
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
+        prs_truncated: bool,
+        review_truncated: bool,
         now: float,
     ) -> None:
         """Hand this read to the cache, ignoring a write that could not land.
@@ -1067,6 +1323,8 @@ class RemoteReader:
                 prs_known=prs is not None,
                 review_prs={} if review is None else review,
                 review_prs_known=review is not None,
+                prs_truncated=prs_truncated,
+                review_prs_truncated=review_truncated,
             ),
         )
 
@@ -1078,14 +1336,15 @@ class RemoteReader:
         or the column keeps reporting a state the user has already fixed. A
         checkout onto another branch is caught here too.
         """
-        self._adopt_origins(repos)
+        patches = self._adopt_origins(repos)
         known = self._covered(repos)
-        if not known:
-            return
-        self._apply(known, self._ref_lines(known), self._checkouts(known))
+        if known:
+            lines, listings = self._local_refs(known)
+            patches |= self._apply(known, lines, branches_at(known, listings))
+        self._fold(patches)
 
-    def _adopt_origins(self, repos: Sequence[Repo]) -> None:
-        """Give a repo its origin URL before any network read has covered it.
+    def _adopt_origins(self, repos: Sequence[Repo]) -> dict[Path, _Patch]:
+        """Return the origin-URL patch for each repo no network read has covered.
 
         ``git remote get-url`` reads a local config file, so the dashboard can
         name every origin on its first poll rather than after the first network
@@ -1094,11 +1353,8 @@ class RemoteReader:
         """
         fresh = [repo for repo in repos if repo.path not in self._origin_urls]
         if not fresh:
-            return
-        for path, url in self._origins(fresh).items():
-            state = self._states.get(path, UNKNOWN)
-            if state.origin is None:
-                self._states[path] = replace(state, origin=url)
+            return {}
+        return {path: _named(url) for path, url in self._origins(fresh).items()}
 
     def _covered(self, repos: Sequence[Repo]) -> list[Repo]:
         """Return the repos a read has already answered for."""
@@ -1113,19 +1369,44 @@ class RemoteReader:
         known: Sequence[Repo],
         lines: Mapping[Path, str],
         checkouts: Mapping[Path, str],
-    ) -> None:
-        """Recompute both behind markers for every repo a read has answered for."""
+    ) -> dict[Path, _Patch]:
+        """Return the behind-marker patch of every repo a read has answered for.
+
+        Repos whose markers did not move are left out, so the steady poll folds
+        an empty mapping and replaces nothing.
+        """
         heads = {family: parse_heads(text) for family, text in lines.items()}
+        patches: dict[Path, _Patch] = {}
         for repo in known:
-            state = self._states[repo.path]
-            fresh = self._rederive(
+            state = self._states.get(repo.path)
+            if state is None:
+                continue
+            patch = self._rederive(
                 repo,
                 state,
                 heads.get(repo.family, {}),
                 checkouts.get(repo.path),
             )
-            if fresh != state:
-                self._states[repo.path] = fresh
+            if patch is not None:
+                patches[repo.path] = patch
+        return patches
+
+    def _fold(self, patches: Mapping[Path, _Patch]) -> None:
+        """Apply ``patches`` to the live states, one path at a time.
+
+        Each patch reads the current reading and writes it straight back, so a
+        network read that landed while the patch was being computed keeps its
+        sha, pull requests and checks rather than being overwritten by a state
+        derived before it. A patch landing while :meth:`_rebuild` swaps the
+        dict writes into the one it replaced and is dropped; the next poll
+        recomputes it two seconds later.
+
+        A repo no read has covered gets its entry made here, which is how the
+        first poll names an origin.
+        """
+        for path, patch in patches.items():
+            states = self._states
+            states[path] = patch(states.get(path, UNKNOWN))
 
     def _rederive(
         self,
@@ -1133,12 +1414,11 @@ class RemoteReader:
         state: RemoteState,
         heads: dict[str, str],
         checkout: str | None,
-    ) -> RemoteState:
-        """Return ``state`` with both behind markers recomputed from the local refs.
+    ) -> _Patch | None:
+        """Return the patch recomputing ``state``'s behind markers, or None.
 
         A checkout that has moved since the read drops the branch answer
-        entirely: it was about the branch that was here then, and the next
-        network read is what fills the new one in.
+        entirely, which :func:`_moved` carries.
         """
         behind_default = self._behind(
             repo,
@@ -1147,21 +1427,14 @@ class RemoteReader:
             state.default_sha,
         )
         if checkout != state.branch:
-            return replace(
-                state,
-                behind_default=behind_default,
-                branch=checkout,
-                branch_remote=None,
-                branch_sha=None,
-                branch_known=False,
-                behind_branch=False,
-                branch_merged_pr=None,
-            )
-        return replace(
-            state,
-            behind_default=behind_default,
-            behind_branch=self._behind(repo, heads, state.branch, state.branch_sha),
-        )
+            return _moved(behind_default=behind_default, branch=checkout)
+        behind_branch = self._behind(repo, heads, state.branch, state.branch_sha)
+        if (behind_default, behind_branch) == (
+            state.behind_default,
+            state.behind_branch,
+        ):
+            return None
+        return _markers(behind_default=behind_default, behind_branch=behind_branch)
 
     def _state(
         self,
@@ -1172,6 +1445,8 @@ class RemoteReader:
         merged: Mapping[str, Mapping[str, MergedPR]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
+        prs_truncated: bool,
+        review_truncated: bool,
         branch: str | None,
         target: str | None,
     ) -> RemoteState:
@@ -1204,6 +1479,10 @@ class RemoteReader:
             prs_known=slug is None or prs is not None,
             review_prs=() if slug is None or review is None else review.get(slug, ()),
             review_prs_known=slug is None or review is not None,
+            prs_truncated=prs_truncated and slug is not None and prs is not None,
+            review_prs_truncated=(
+                review_truncated and slug is not None and review is not None
+            ),
             branch=branch,
             branch_remote=remote_branch,
             branch_sha=(
@@ -1234,7 +1513,9 @@ class RemoteReader:
 
         The answer is memoized per family on both shas, so a repo nobody has
         touched costs no process on the next poll, and its worktrees cost none
-        either.
+        either. The memo is capped at :data:`ANCESTRY_LIMIT`; the other thread
+        writing the same key writes the same answer, so the write needs no
+        lock.
         """
         if branch is None or sha is None:
             return False
@@ -1243,20 +1524,24 @@ class RemoteReader:
             return False
 
         key = (repo.family, local, sha)
-        contained = self._ancestry.get(key)
+        memo = self._ancestry
+        contained = memo.get(key)
         if contained is None:
             contained = (
                 self._runner(repo.path, ("merge-base", "--is-ancestor", sha, local))
                 is not None
             )
-            self._ancestry[key] = contained
+            memo.setdefault(key, contained)
+            _trim(memo)
         return not contained
 
     def _origins(self, repos: Sequence[Repo]) -> dict[Path, str]:
         """Read each family's origin URL, and hand it back per path.
 
         Answered per family and handed back per path, because the caller holds
-        one state per row.
+        one state per row. ``_origin_urls`` records which paths have been
+        asked; ``setdefault`` writes it one atomic operation per path, and the
+        two threads that reach it derive the same URL.
         """
 
         def origin(repo: Repo) -> tuple[Path, str | None]:
@@ -1268,7 +1553,8 @@ class RemoteReader:
             for family, url in self._map(origin, leaders(repos))
             if url is not None
         }
-        self._origin_urls.update({repo.path: found.get(repo.family) for repo in repos})
+        for repo in repos:
+            self._origin_urls.setdefault(repo.path, found.get(repo.family))
         return {repo.path: found[repo.family] for repo in repos if repo.family in found}
 
     def _probe(
@@ -1282,6 +1568,10 @@ class RemoteReader:
         Keyed by URL rather than by path, which is the same key the GraphQL
         answers use and never collides with an ``owner/name``. One call carries
         both questions, because a second would be a second ssh handshake.
+
+        The batch is capped at :data:`PROBE_TIMEOUT`. An origin that has not
+        answered by then is dropped and its repo reads unknown, rather than
+        holding every other origin for the full :data:`LS_REMOTE_TIMEOUT`.
         """
         elsewhere = [
             repo
@@ -1302,46 +1592,72 @@ class RemoteReader:
 
         defaults: dict[str, tuple[str, str]] = {}
         tips: dict[str, dict[str, str]] = {}
-        for url, default, found in self._map(probe, elsewhere):
+        for url, default, found in self._within(probe, elsewhere, PROBE_TIMEOUT):
             if default is not None:
                 defaults[url] = default
             if found:
                 tips[url] = found
         return defaults, tips
 
-    def _checkouts(self, repos: Sequence[Repo]) -> dict[Path, str]:
-        """Return the branch checked out at each path, read once per family.
+    def _local_refs(
+        self,
+        repos: Sequence[Repo],
+    ) -> tuple[dict[Path, str], dict[Path, dict[str, str]]]:
+        """Return each family's branch tips and worktree listing.
 
-        ``worktree list`` answers for a repo and all its worktrees at once, so
-        this costs one git call per family rather than one per row. Git prints
-        resolved paths, so a row reached through a symlink is looked up under
-        both spellings.
+        ``for-each-ref`` and ``worktree list`` both answer for a repo and all
+        its linked worktrees at once, so both run once per family rather than
+        once per row, and both run in the same pool task.
+
+        A family whose :func:`ref_mark` has not moved since the last call keeps
+        the answer it gave then and runs neither batch. On the 2s poll that
+        leaves an idle watch list spawning no subprocesses at all.
         """
+        families = leaders(repos)
+        marks = {repo.family: ref_mark(repo.family) for repo in families}
+        stale = [repo for repo in families if self._ref_moved(repo.family, marks)]
+        for repo, answer in zip(
+            stale, self._map(self._read_family, stale), strict=True
+        ):
+            self._ref_reads[repo.family] = answer
+            mark = marks[repo.family]
+            if mark is None:
+                self._ref_marks.pop(repo.family, None)
+            else:
+                self._ref_marks[repo.family] = mark
+        lines: dict[Path, str] = {}
+        listings: dict[Path, dict[str, str]] = {}
+        for repo in families:
+            answer = self._ref_reads.get(repo.family)
+            if answer is not None:
+                lines[repo.family], listings[repo.family] = answer
+        return lines, listings
 
-        def listing(repo: Repo) -> tuple[Path, dict[str, str]]:
-            out = self._runner(repo.path, _WORKTREES_ARGS)
-            return repo.family, {} if out is None else parse_worktrees(out)
+    def _ref_moved(
+        self,
+        family: Path,
+        marks: Mapping[Path, tuple[float, int, float, float] | None],
+    ) -> bool:
+        """Return whether ``family`` has to run both git batches again.
 
-        by_family = dict(self._map(listing, leaders(repos)))
-        found: dict[Path, str] = {}
-        for repo in repos:
-            listed = by_family.get(repo.family, {})
-            branch = listed.get(str(repo.path)) or listed.get(str(repo.path.resolve()))
-            if branch is not None:
-                found[repo.path] = branch
-        return found
-
-    def _ref_lines(self, repos: Sequence[Repo]) -> dict[Path, str]:
-        """Read each family's branch tips and upstreams once, unparsed.
-
-        Handed on as text because two callers want different fields out of it,
-        and a second ``for-each-ref`` would be the same answer read twice.
+        The mark is taken before the batches run, so a ref written between the
+        two costs one extra read on the next poll rather than being missed.
         """
+        mark = marks[family]
+        if mark is None or family not in self._ref_reads:
+            return True
+        return mark != self._ref_marks.get(family)
 
-        def refs(repo: Repo) -> tuple[Path, str]:
-            return repo.family, self._runner(repo.path, _HEADS_ARGS) or ""
+    def _read_family(self, repo: Repo) -> tuple[str, dict[str, str]]:
+        """Read one family's branch tips and worktree listing in one pool task.
 
-        return dict(self._map(refs, leaders(repos)))
+        The tips are handed on as text because two callers want different
+        fields out of them, and a second ``for-each-ref`` would be the same
+        answer read twice.
+        """
+        lines = self._runner(repo.path, _HEADS_ARGS) or ""
+        out = self._runner(repo.path, _WORKTREES_ARGS)
+        return lines, {} if out is None else parse_worktrees(out)
 
     def _targets(
         self,
@@ -1429,10 +1745,20 @@ class RemoteReader:
             merged.update(landed)
         return defaults, tips, states, merged
 
-    def _prs(self, args: Sequence[str]) -> dict[str, tuple[PullRequest, ...]] | None:
-        """Run one PR search across every repo, or return None on failure."""
+    def _prs(
+        self,
+        args: Sequence[str],
+    ) -> tuple[dict[str, tuple[PullRequest, ...]] | None, bool]:
+        """Run one PR search across every repo, and say whether it hit the limit.
+
+        The mapping is None on failure, which is a different answer from an
+        empty one. A failed search reports no truncation: it found nothing to
+        cut short.
+        """
         out = self._gh(args)
-        return None if out is None else parse_prs(out)
+        if out is None:
+            return None, False
+        return parse_prs(out), search_at_limit(out)
 
     def _map[T, R](self, work: Callable[[T], R], items: Sequence[T]) -> list[R]:
         """Run ``work`` over ``items`` across the pool, preserving order."""
@@ -1442,14 +1768,57 @@ class RemoteReader:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(work, items))
 
+    def _within[T, R](
+        self,
+        work: Callable[[T], R],
+        items: Sequence[T],
+        deadline: float,
+    ) -> list[R]:
+        """Run ``work`` over ``items``, dropping what misses ``deadline``.
+
+        Order is not preserved, unlike :meth:`_map`. The pool is shut down
+        without waiting, so a straggler finishes into a thread nobody reads
+        rather than holding the caller past the deadline.
+        """
+        if not items:
+            return []
+        pool = ThreadPoolExecutor(max_workers=min(self._max_workers, len(items)))
+        try:
+            pending = [pool.submit(work, item) for item in items]
+            found: list[R] = []
+            try:
+                for ready in as_completed(pending, timeout=deadline):
+                    found.append(ready.result())  # noqa: PERF401 — partial batch
+            except TimeoutError:
+                pass
+            return found
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def forget_absent(self, repos: Iterable[Repo]) -> None:
-        """Drop readings, origins and memoized ancestry for repos off the watch list."""
+        """Drop readings, origins and memoized ancestry for repos off the watch list.
+
+        Each dict is captured once and popped from that reference. A rebuild
+        that swaps ``_states`` mid-call leaves these deletes on the dict it
+        replaced, rather than raising or dropping a repo the rebuild just
+        answered for.
+        """
         watched = list(repos)
         live = {repo.path for repo in watched}
         families = {repo.family for repo in watched}
-        for path in [key for key in self._states if key not in live]:
-            del self._states[path]
-        for path in [key for key in self._origin_urls if key not in live]:
-            del self._origin_urls[path]
-        for key in [entry for entry in self._ancestry if entry[0] not in families]:
-            del self._ancestry[key]
+        states = self._states
+        for path in list(states):
+            if path not in live:
+                states.pop(path, None)
+        origins = self._origin_urls
+        for path in list(origins):
+            if path not in live:
+                origins.pop(path, None)
+        ancestry = self._ancestry
+        for key in list(ancestry):
+            if key[0] not in families:
+                ancestry.pop(key, None)
+        for cache in (self._ref_marks, self._ref_reads):
+            for family in list(cache):
+                if family not in families:
+                    cache.pop(family, None)

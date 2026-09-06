@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import shutil
 import threading
 import time
@@ -12,6 +14,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 from conftest import RecordingRunner, git
 from textual.widgets import DataTable, Footer, Header
+from textual.worker import WorkerCancelled
 
 from cboard2.board import Board, Row, group_families
 from cboard2.config import Config, load_config
@@ -25,6 +28,7 @@ from cboard2.tui import (
     DetailScreen,
     Fold,
     NameFilter,
+    _origin_color,
     _paint,
     active_text,
     cap_worktrees,
@@ -39,9 +43,12 @@ from cboard2.tui import (
     row_cells,
     sort_rows,
     state_text,
+    worker_cancelled,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
     from rich.text import Text
     from textual.content import Content
     from textual.notifications import SeverityLevel
@@ -94,8 +101,13 @@ def _row(
 
 
 async def _settle(app: CboardApp) -> None:
-    """Wait for the poll worker so the table holds real readings."""
-    await app.workers.wait_for_complete()  # pyright: ignore[reportUnknownMemberType]
+    """Wait for the poll worker so the table holds real readings.
+
+    A superseded exclusive poll raises out of ``wait_for_complete``; that is
+    the dashboard working, not a failure.
+    """
+    with contextlib.suppress(WorkerCancelled):
+        await app.workers.wait_for_complete()  # pyright: ignore[reportUnknownMemberType]
 
 
 def _table(app: CboardApp) -> DataTable[str | Text]:
@@ -123,7 +135,7 @@ async def test_lists_every_repo_with_live_state(
     assert cells[0] == git_repo.name
     assert cells[1] == "main"
     assert "?1" in cells[4]
-    assert list((tmp_path / "cache").rglob("*")) == []
+    assert not (tmp_path / "cache" / "cboard2" / "remote.json").exists()
 
 
 @pytest.mark.asyncio
@@ -508,7 +520,8 @@ async def test_a_repo_joining_the_visible_set_reorders(tmp_path: Path) -> None:
         await pilot.pause()
         assert _keys(app) == [str(Path("/tmp/beta")), str(Path("/tmp/alpha"))]  # noqa: S108
 
-        app.apply_rows([*rows, _row("gamma", active_at=500.0)])
+        # Board hands rows over newest first, which is where gamma lands.
+        app.apply_rows([_row("gamma", active_at=500.0), *rows])
         await pilot.pause()
         joined = _keys(app)
 
@@ -792,6 +805,21 @@ def _record_severities(
     monkeypatch.setattr(app, "notify", note)
 
 
+def _record_both(
+    app: CboardApp,
+    notes: list[str],
+    severities: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collect each notification's message and its severity."""
+
+    def note(message: object, **kwargs: object) -> None:
+        notes.append(str(message))
+        severities.append(str(kwargs.get("severity", "information")))
+
+    monkeypatch.setattr(app, "notify", note)
+
+
 def _styles(content: Content) -> list[tuple[str, str]]:
     """Return each styled run as its text and its style, in document order."""
     return [
@@ -882,6 +910,18 @@ def test_origin_style_groups_repos_by_host_and_owner() -> None:
     assert origin_style(ssh) == origin_style(https) != ""
     assert origin_style(other) != origin_style(ssh)
     assert origin_style(_row("d")) == ""
+
+
+def test_the_origin_color_is_hashed_once_per_host_and_owner() -> None:
+    _origin_color.cache_clear()
+    ssh = _row("a", remote=replace(UNKNOWN, origin="git@github.com:ove/one.git"))
+    https = _row("b", remote=replace(UNKNOWN, origin="https://github.com/ove/two"))
+
+    color = origin_style(ssh)
+
+    assert origin_style(https) == color
+    assert origin_style(ssh) == color
+    assert _origin_color.cache_info().misses == 1
 
 
 def test_repo_name_carries_the_origin_color(tmp_path: Path) -> None:
@@ -1176,6 +1216,7 @@ async def test_pressing_shift_p_pulls_the_selected_repo(
         root: Path,
         *,
         default_branch: str | None = None,
+        **_kwargs: object,
     ) -> Outcome:
         asked.append((root, default_branch))
         return Outcome(ok=True, message="pulled 3 commits", branch="main")
@@ -1209,7 +1250,12 @@ async def test_a_second_shift_p_does_not_start_a_second_pull(
     release = threading.Event()
     runs: list[Path] = []
 
-    def blocking_pull(root: Path, *, default_branch: str | None = None) -> Outcome:
+    def blocking_pull(
+        root: Path,
+        *,
+        default_branch: str | None = None,
+        **_kwargs: object,
+    ) -> Outcome:
         assert default_branch == "main"
         runs.append(root)
         started.set()
@@ -1374,6 +1420,19 @@ def test_the_fold_keeps_the_worktrees_with_the_newest_activity() -> None:
     painted = cap_worktrees(sort_rows(rows, "name"), limit=2)
 
     assert _names(painted) == ["hub", "fresh", "tree00"]
+
+
+def test_worktrees_tied_on_activity_keep_the_listed_order() -> None:
+    rows = [
+        _row("hub", active_at=100.0),
+        _row("first", active_at=7.0, main_git_dir=_HUB_GIT),
+        _row("second", active_at=7.0, main_git_dir=_HUB_GIT),
+        _row("third", active_at=7.0, main_git_dir=_HUB_GIT),
+    ]
+
+    painted = cap_worktrees(rows, limit=2)
+
+    assert _names(painted) == ["hub", "first", "second"]
 
 
 def test_an_expanded_family_paints_every_worktree() -> None:
@@ -1729,3 +1788,324 @@ def test_an_unread_review_search_says_so(tmp_path: Path) -> None:
     screen = DetailScreen(_row("repo"), _board(tmp_path), clock=lambda: 0.0)
 
     assert screen.review_content(0.0).plain == "not read"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_poll_does_not_apply_its_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling stops the awaiting task, so the thread finishes with stale rows."""
+    started = threading.Event()
+    release = threading.Event()
+    checked = threading.Event()
+    seen: list[bool] = []
+    applied: list[int] = []
+
+    def blocking_refresh(**_kwargs: object) -> list[Row]:
+        started.set()
+        release.wait(timeout=5.0)
+        return [_row("stale")]
+
+    def watched() -> bool:
+        answer = worker_cancelled()
+        seen.append(answer)
+        checked.set()
+        return answer
+
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        monkeypatch.setattr(app._board, "refresh", blocking_refresh)  # noqa: SLF001
+
+        def record(rows: Sequence[Row]) -> None:
+            applied.append(len(rows))
+
+        monkeypatch.setattr(app, "apply_rows", record)
+        monkeypatch.setattr("cboard2.tui.worker_cancelled", watched)
+
+        worker = app.poll()
+        assert await asyncio.to_thread(started.wait, 5.0)
+        worker.cancel()
+        release.set()
+        assert await asyncio.to_thread(checked.wait, 5.0)
+        await pilot.pause()
+
+    assert seen == [True]
+    assert applied == []
+
+
+@pytest.mark.asyncio
+async def test_a_poll_that_raises_notifies_and_leaves_the_app_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def exploding_refresh(**_kwargs: object) -> list[Row]:
+        message = "disk gone"
+        raise OSError(message)
+
+    notes: list[str] = []
+    severities: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        monkeypatch.setattr(app._board, "refresh", exploding_refresh)  # noqa: SLF001
+        _record_both(app, notes, severities, monkeypatch)
+
+        app.poll()
+        await _settle(app)
+        await pilot.pause()
+
+        assert app.is_running
+
+    assert notes[-1] == "poll failed: disk gone"
+    assert severities[-1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_remote_read_that_raises_notifies_and_leaves_the_app_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def exploding_read(**_kwargs: object) -> bool:
+        message = "gh is gone"
+        raise OSError(message)
+
+    notes: list[str] = []
+    severities: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        monkeypatch.setattr(app._board, "read_remote", exploding_read)  # noqa: SLF001
+        _record_both(app, notes, severities, monkeypatch)
+
+        app.poll_remote()
+        await _settle(app)
+        await pilot.pause()
+
+        assert app.is_running
+
+    assert notes[-1] == "remote read failed: gh is gone"
+    assert severities[-1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_pull_that_raises_releases_the_path_and_notifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the release, that repo would refuse every later pull."""
+
+    def exploding_pull(_root: Path, **_kwargs: object) -> Outcome:
+        message = "git blew up"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr("cboard2.tui.pull_default", exploding_pull)
+    notes: list[str] = []
+    severities: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+        _record_both(app, notes, severities, monkeypatch)
+
+        await pilot.press("P")
+        await _settle(app)
+        await pilot.pause()
+
+        assert app.is_running
+        assert app._pulling == set()  # noqa: SLF001
+
+    assert notes[-1] == "stale: pull could not run: git blew up"
+    assert severities[-1] == "error"
+
+
+async def _wait_for_a_pull(started: threading.Semaphore) -> bool:
+    """Wait off the event loop for one more pull worker to reach its git call."""
+    return await asyncio.to_thread(started.acquire, timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_pulls_past_the_cap_wait_their_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Six repos, four workers: the rest run as the earlier ones finish."""
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    counter = threading.Lock()
+    runs: list[Path] = []
+    inflight = 0
+    peak = 0
+
+    def blocking_pull(root: Path, **_kwargs: object) -> Outcome:
+        nonlocal inflight, peak
+        with counter:
+            inflight += 1
+            peak = max(peak, inflight)
+            runs.append(root)
+        started.release()
+        release.wait(timeout=5.0)
+        with counter:
+            inflight -= 1
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", blocking_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row(f"repo{index}", remote=BEHIND) for index in range(6)])
+        await pilot.pause()
+
+        for _ in range(6):
+            await pilot.press("P")
+            await pilot.press("down")
+        for _ in range(4):
+            assert await _wait_for_a_pull(started)
+
+        await pilot.pause()
+        assert peak == 4
+        assert len(runs) == 4
+
+        release.set()
+        for _ in range(2):
+            assert await _wait_for_a_pull(started)
+        await _settle(app)
+        await pilot.pause()
+
+        assert app._pulling == set()  # noqa: SLF001
+
+    assert peak == 4
+    assert len(runs) == 6
+
+
+def test_the_pr_cell_reads_the_checks_state_once_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def counting_worst(prs: object) -> str:
+        calls.append(len(cast("tuple[PullRequest, ...]", prs)))
+        return "failing"
+
+    monkeypatch.setattr("cboard2.tui.worst_checks", counting_worst)
+    state = RemoteState(
+        prs_known=True,
+        prs=(replace(_pr(3), checks="failing"),),
+        review_prs_known=True,
+        review_prs=(_pr(8),),
+    )
+
+    cell = pr_text(_row("repo", remote=state))
+
+    assert len(calls) == 1
+    assert cell.plain == "1 ✗  1 to review"
+    assert str(cell.style) == "red"
+
+
+@pytest.mark.asyncio
+async def test_the_subtitle_names_the_step_a_pull_is_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_pull(
+        _root: Path,
+        *,
+        on_step: Callable[[str], None] = lambda _step: None,
+        **_kwargs: object,
+    ) -> Outcome:
+        on_step("fetching")
+        started.set()
+        release.wait(timeout=5.0)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", blocking_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+
+        await pilot.press("P")
+        assert await asyncio.to_thread(started.wait, 5.0)
+        await pilot.pause()
+        during = app.sub_title
+
+        release.set()
+        await _settle(app)
+        await pilot.pause()
+        after = app.sub_title
+
+    assert "stale fetching" in during
+    assert "fetching" not in after
+
+
+@pytest.mark.asyncio
+async def test_a_family_that_leaves_disk_loses_its_expansion_state(
+    tmp_path: Path,
+) -> None:
+    """Both sets would otherwise grow for the length of the session."""
+    gone = _row("gone")
+    kept = _row("kept")
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([gone, kept])
+        app.toggle_fold(gone.state.family)
+        app.toggle_fold(kept.state.family)
+        app._pulling.add(gone.state.path)  # noqa: SLF001
+        await pilot.pause()
+
+        app.apply_rows([kept])
+        await pilot.pause()
+
+        assert app._expanded == {kept.state.family}  # noqa: SLF001
+        assert app._pulling == set()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_queued_pull_keeps_its_entry_through_a_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Semaphore(0)
+    release = threading.Event()
+
+    def blocking_pull(_root: Path, **_kwargs: object) -> Outcome:
+        started.release()
+        release.wait(timeout=5.0)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", blocking_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        pulling = _row("pulling", remote=BEHIND)
+        app.apply_rows([pulling])
+        await pilot.pause()
+
+        await pilot.press("P")
+        assert await _wait_for_a_pull(started)
+
+        app.apply_rows([])
+        await pilot.pause()
+
+        assert app._pulling == {pulling.state.path}  # noqa: SLF001
+
+        release.set()
+        await _settle(app)
+        await pilot.pause()
+
+    assert app._pulling == set()  # noqa: SLF001

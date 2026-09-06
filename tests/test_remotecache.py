@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from cboard2 import remote, remotecache
 from cboard2.remote import Cached, MergedPR, PullRequest
 from cboard2.remotecache import VERSION, cache_path, load, save
 
@@ -356,3 +357,21 @@ def test_a_stored_pr_without_a_checks_field_reads_as_unknown(tmp_path: Path) -> 
     assert read.prs["acme/one"][0].checks == "unknown"
     assert read.review_prs == {}
     assert read.review_prs_known is False
+
+
+def test_the_dict_coercion_helper_has_one_definition() -> None:
+    """Remotecache reads JSON through remote's helper rather than a copy of it."""
+    assert remotecache.as_dict is remote.as_dict
+
+
+def test_the_truncation_flags_survive_a_round_trip(tmp_path: Path) -> None:
+    """A restart keeps knowing each search hit its limit."""
+    path = tmp_path / "remote.json"
+    cached = replace(_cached(), prs_truncated=True, review_prs_truncated=False)
+
+    assert save(path, cached) is True
+
+    restored = load(path)
+    assert restored is not None
+    assert restored.prs_truncated is True
+    assert restored.review_prs_truncated is False

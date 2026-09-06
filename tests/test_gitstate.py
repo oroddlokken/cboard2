@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -10,11 +11,15 @@ from conftest import RecordingRunner, git, git_may_fail
 
 from cboard2 import gitstate
 from cboard2.discovery import Repo
-from cboard2.gitstate import Poller, parse_porcelain_v2
+from cboard2.gitstate import (
+    Poller,
+    RepoState,
+    parse_porcelain_v2,
+    state_parts,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
 INTERVAL = 4 * 3600.0
 
@@ -199,6 +204,20 @@ def test_parses_branch_upstream_and_counts() -> None:
     assert snap.unstaged == 1
     assert snap.unmerged == 1
     assert snap.untracked == 1
+    assert not snap.dirty_capped
+
+
+def test_status_parsing_stops_at_the_cap() -> None:
+    text = "# branch.head main\n" + "".join(
+        f"? untracked{index}.txt\n" for index in range(10)
+    )
+
+    snap = parse_porcelain_v2(text, cap=4)
+
+    assert snap.branch == "main"
+    assert snap.untracked == 4
+    assert len(snap.dirty_paths) == 4
+    assert snap.dirty_capped
 
 
 def test_parses_initial_and_detached_markers() -> None:
@@ -305,8 +324,31 @@ def test_a_stash_is_counted_and_shown(git_repo: Path) -> None:
     state = Poller(INTERVAL).poll([_repo(git_repo)])[0]
 
     assert state.stashed == 2
+    assert not state.stashed_capped
     assert state.dirty == 0
     assert gitstate.state_parts(state) == ["stash 2"]
+
+
+def test_stash_depth_stops_at_the_cap(tmp_path: Path) -> None:
+    refs = tmp_path / "logs" / "refs"
+    refs.mkdir(parents=True)
+    (refs / "stash").write_text("entry\n" * 10, encoding="utf-8")
+
+    depth = gitstate.count_stashes(tmp_path, cap=4)
+
+    assert depth.count == 4
+    assert depth.capped
+
+
+def test_stash_depth_under_the_cap_is_the_real_depth(tmp_path: Path) -> None:
+    refs = tmp_path / "logs" / "refs"
+    refs.mkdir(parents=True)
+    (refs / "stash").write_text("entry\n" * 3, encoding="utf-8")
+
+    depth = gitstate.count_stashes(tmp_path, cap=4)
+
+    assert depth.count == 3
+    assert not depth.capped
 
 
 def test_a_repo_with_no_stash_counts_none(git_repo: Path) -> None:
@@ -324,3 +366,46 @@ def test_a_worktree_reports_the_repos_stash(git_repo: Path, worktree: Path) -> N
     state = Poller(INTERVAL).poll([_worktree(worktree, git_repo)])[0]
 
     assert state.stashed == 1
+
+
+def test_a_capped_dirty_count_is_marked_as_partial() -> None:
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=0.0,
+        unstaged=5000,
+        untracked=200,
+        dirty_capped=True,
+    )
+
+    assert state_parts(state) == ["M5000+", "?200+"]
+
+
+def test_a_capped_stash_depth_is_marked_as_partial() -> None:
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=0.0,
+        stashed=1000,
+        stashed_capped=True,
+    )
+
+    assert state_parts(state) == ["stash 1000+"]
+
+
+def test_an_uncapped_reading_carries_no_marker() -> None:
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=0.0,
+        unstaged=3,
+        stashed=2,
+    )
+
+    assert state_parts(state) == ["M3", "stash 2"]

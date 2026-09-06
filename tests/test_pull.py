@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from cboard2.pull import Step, find_default_branch, pull_default, run_step
+from cboard2.pull import (
+    FETCH_TIMEOUT,
+    PULL_TIMEOUT,
+    Step,
+    find_default_branch,
+    pull_default,
+    run_step,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -419,3 +426,46 @@ def test_run_step_disables_the_credential_prompt(
     run_step(Path(), ("fetch", "--prune"))
 
     assert seen["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_each_step_is_named_as_it_starts(tmp_path: Path) -> None:
+    git = FakeGit(_answers())
+    steps: list[str] = []
+
+    pull_default(tmp_path, runner=git, on_step=steps.append)
+
+    assert steps == ["fetching", "checking out main", "pulling main"]
+
+
+def test_a_repo_already_on_the_default_branch_names_no_checkout(
+    tmp_path: Path,
+) -> None:
+    git = FakeGit({**_answers(), _HEAD: _out("main")})
+    steps: list[str] = []
+
+    pull_default(tmp_path, runner=git, on_step=steps.append)
+
+    assert steps == ["fetching", "pulling main"]
+
+
+def test_the_fetch_gets_a_shorter_timeout_than_the_steps_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[float] = []
+
+    def fake_run(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert args
+        seen.append(cast("float", kwargs["timeout"]))
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_step(Path(), ("fetch", "--prune"))
+    run_step(Path(), ("checkout", "main"))
+
+    assert FETCH_TIMEOUT < PULL_TIMEOUT
+    assert seen == [FETCH_TIMEOUT, PULL_TIMEOUT]

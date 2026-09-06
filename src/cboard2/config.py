@@ -132,14 +132,16 @@ def load_config(path: Path | None = None) -> Config:
 
     return Config(
         roots=_paths(data, "roots", DEFAULT_ROOTS),
-        max_depth=_depth(data),
+        max_depth=_non_negative_int(data, "max_depth", DEFAULT_MAX_DEPTH),
         dormant=_paths(data, "dormant", ()),
         dormant_interval=_interval(data, "dormant_interval", DEFAULT_DORMANT_INTERVAL),
         remote=_flag(data, "remote", fallback=DEFAULT_REMOTE),
         remote_interval=_interval(data, "remote_interval", DEFAULT_REMOTE_INTERVAL),
         origin_colors=_flag(data, "origin_colors", fallback=DEFAULT_ORIGIN_COLORS),
         worktrees=_flag(data, "worktrees", fallback=DEFAULT_WORKTREES),
-        worktree_limit=_worktree_limit(data),
+        worktree_limit=_non_negative_int(
+            data, "worktree_limit", DEFAULT_WORKTREE_LIMIT
+        ),
     )
 
 
@@ -159,20 +161,11 @@ def _paths(
     return tuple(Path(entry).expanduser() for entry in entries)
 
 
-def _depth(data: dict[str, object]) -> int:
-    """Read ``max_depth``, rejecting a non-integer or negative value."""
-    value = data.get("max_depth", DEFAULT_MAX_DEPTH)
+def _non_negative_int(data: dict[str, object], key: str, fallback: int) -> int:
+    """Read an integer key, rejecting a non-integer or negative value."""
+    value = data.get(key, fallback)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = "max_depth must be a non-negative integer"
-        raise ConfigError(msg)
-    return value
-
-
-def _worktree_limit(data: dict[str, object]) -> int:
-    """Read ``worktree_limit``, rejecting a non-integer or negative value."""
-    value = data.get("worktree_limit", DEFAULT_WORKTREE_LIMIT)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = "worktree_limit must be a non-negative integer"
+        msg = f"{key} must be a non-negative integer"
         raise ConfigError(msg)
     return value
 

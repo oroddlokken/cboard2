@@ -18,8 +18,10 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import islice
 from typing import TYPE_CHECKING
 
+from cboard2.constants import GITSTATE_MAX_WORKERS
 from cboard2.discovery import git_dir, main_name
 from cboard2.lastedit import newest_mtime
 
@@ -34,10 +36,15 @@ if TYPE_CHECKING:
 GIT_TIMEOUT = 5.0
 """Seconds before a single git call is abandoned and the repo reported unreadable."""
 
-DEFAULT_MAX_WORKERS = 16
-"""Concurrent git calls during one poll."""
-
 _STATUS_ARGS = ("status", "--porcelain=v2", "--branch")
+
+STATUS_CAP = 5000
+"""Status entry lines parsed per repo before the counts are called partial.
+
+A repo with 50k untracked files would otherwise be parsed in full on every 2s
+tick. Past this many entries the counts and paths cover the first
+:data:`STATUS_CAP` lines only.
+"""
 _HEAD_ARGS = ("log", "-1", "--format=%s%x09%ct")
 
 _PATH_FIELD_INDEX = {"1": 8, "2": 9, "u": 10}
@@ -58,6 +65,9 @@ _OPERATION_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 Checked in the order git resolves them: a rebase that stopped on a conflict
 also has a ``MERGE_HEAD``, and rebase is the operation the user has to finish.
 """
+
+STASH_CAP = 1000
+"""Stash reflog lines counted per repo before the depth is called approximate."""
 
 _STASH_LOG = "logs/refs/stash"
 _STASH_REF = "refs/stash"
@@ -99,10 +109,16 @@ class RepoState:
     stashed: int = 0
     """Entries on the stash, shared with this repo's linked worktrees."""
 
+    stashed_capped: bool = False
+    """The stash holds more than :data:`STASH_CAP` entries, so ``stashed`` is that."""
+
     ahead: int = 0
     behind: int = 0
     upstream: str | None = None
     dirty_paths: tuple[str, ...] = ()
+    dirty_capped: bool = False
+    """More dirty entries than :data:`STATUS_CAP`, so the counts are partial."""
+
     last_edit: float | None = None
     last_edit_capped: bool = False
     main_git_dir: Path | None = None
@@ -161,6 +177,20 @@ class Snapshot:
     untracked: int
     unmerged: int
     dirty_paths: tuple[str, ...]
+    dirty_capped: bool = False
+    """More entry lines than :data:`STATUS_CAP`, so every count above is partial."""
+
+
+@dataclass(frozen=True, slots=True)
+class StashDepth:
+    """How many stash entries were counted, and whether counting stopped early.
+
+    ``capped`` means the stash is deeper than :data:`STASH_CAP`, so ``count``
+    is that cap rather than the real depth.
+    """
+
+    count: int
+    capped: bool = False
 
 
 def run_git(root: Path, args: Sequence[str]) -> str | None:
@@ -196,7 +226,7 @@ class Poller:
         self,
         dormant_interval: float,
         *,
-        max_workers: int = DEFAULT_MAX_WORKERS,
+        max_workers: int = GITSTATE_MAX_WORKERS,
         runner: GitRunner = run_git,
     ) -> None:
         self._dormant_interval = dormant_interval
@@ -261,7 +291,7 @@ class Poller:
             edit = newest_mtime(repo.path, snap.dirty_paths)
             own = git_dir(repo.path)
             operation = read_operation(own)
-            stashed = count_stashes(repo.main_git_dir or own)
+            stash = count_stashes(repo.main_git_dir or own)
         except (OSError, ValueError):
             return _unreadable(repo, moment)
 
@@ -281,11 +311,13 @@ class Poller:
             untracked=snap.untracked,
             unmerged=snap.unmerged,
             operation=operation,
-            stashed=stashed,
+            stashed=stash.count,
+            stashed_capped=stash.capped,
             ahead=snap.ahead,
             behind=snap.behind,
             upstream=snap.upstream,
             dirty_paths=snap.dirty_paths,
+            dirty_capped=snap.dirty_capped,
             last_edit=edit.at,
             last_edit_capped=edit.capped,
             main_git_dir=repo.main_git_dir,
@@ -329,14 +361,20 @@ def _unreadable(repo: Repo, moment: float) -> RepoState:
     )
 
 
-def parse_porcelain_v2(text: str) -> Snapshot:
-    """Parse ``git status --porcelain=v2 --branch`` output."""
+def parse_porcelain_v2(text: str, *, cap: int = STATUS_CAP) -> Snapshot:
+    """Parse ``git status --porcelain=v2 --branch`` output.
+
+    Parsing stops after ``cap`` entry lines and sets
+    :attr:`Snapshot.dirty_capped`. Git writes the branch headers before the
+    entries, so they are read whatever the cap.
+    """
     branch: str | None = None
     detached = False
     head_sha: str | None = None
     upstream: str | None = None
     ahead = behind = staged = unstaged = untracked = unmerged = 0
     dirty_paths: list[str] = []
+    capped = False
 
     for line in text.splitlines():
         if line.startswith("# branch.head "):
@@ -352,17 +390,21 @@ def parse_porcelain_v2(text: str) -> Snapshot:
             upstream = line.removeprefix("# branch.upstream ")
         elif line.startswith("# branch.ab "):
             ahead, behind = _parse_ab(line.removeprefix("# branch.ab "))
-        elif line.startswith(("1 ", "2 ")):
-            xy = line.split(" ", 2)[1]
-            staged += int(xy[0] != ".")
-            unstaged += int(len(xy) > 1 and xy[1] != ".")
-            dirty_paths.append(_entry_path(line))
-        elif line.startswith("u "):
-            unmerged += 1
-            dirty_paths.append(_entry_path(line))
-        elif line.startswith("? "):
-            untracked += 1
-            dirty_paths.append(unquote_path(line[2:]))
+        elif line.startswith(("1 ", "2 ", "u ", "? ")):
+            if len(dirty_paths) >= cap:
+                capped = True
+                break
+            if line.startswith("? "):
+                untracked += 1
+                dirty_paths.append(unquote_path(line[2:]))
+            elif line.startswith("u "):
+                unmerged += 1
+                dirty_paths.append(_entry_path(line))
+            else:
+                xy = line.split(" ", 2)[1]
+                staged += int(xy[0] != ".")
+                unstaged += int(len(xy) > 1 and xy[1] != ".")
+                dirty_paths.append(_entry_path(line))
 
     return Snapshot(
         branch=branch,
@@ -376,6 +418,7 @@ def parse_porcelain_v2(text: str) -> Snapshot:
         untracked=untracked,
         unmerged=unmerged,
         dirty_paths=tuple(dirty_paths),
+        dirty_capped=capped,
     )
 
 
@@ -392,17 +435,25 @@ def read_operation(git_directory: Path) -> str:
     return NO_OPERATION
 
 
-def count_stashes(git_directory: Path) -> int:
+def count_stashes(git_directory: Path, *, cap: int = STASH_CAP) -> StashDepth:
     """Return how many entries are on the stash, read from its reflog.
 
     A worktree shares the stash with the repo it belongs to, so the caller
     passes the common git directory rather than the worktree's own.
+
+    At most ``cap`` entries are counted, and only that many lines are read off
+    disk; a deeper stash comes back capped.
     """
     try:
-        log = (git_directory / _STASH_LOG).read_text(encoding="utf-8", errors="replace")
+        with (git_directory / _STASH_LOG).open(
+            encoding="utf-8",
+            errors="replace",
+        ) as log:
+            head = list(islice(log, cap + 1))
     except OSError:
-        return int((git_directory / _STASH_REF).exists())
-    return sum(1 for line in log.splitlines() if line.strip())
+        return StashDepth(count=int((git_directory / _STASH_REF).exists()))
+    entries = sum(1 for line in head if line.strip())
+    return StashDepth(count=min(entries, cap), capped=len(head) > cap)
 
 
 def state_parts(state: RepoState) -> list[str]:
@@ -411,10 +462,14 @@ def state_parts(state: RepoState) -> list[str]:
     The halted operation leads: a repo stopped mid-rebase has to be finished
     before the size of its diff is worth reading. The stash trails, because it
     is work the user put down on purpose.
+
+    A count the read stopped short of gets a trailing ``+``, so ``M5000+``
+    reads as at least that many rather than as an exact count.
     """
     parts = [] if state.operation == NO_OPERATION else [state.operation]
+    dirty_mark = "+" if state.dirty_capped else ""
     parts += [
-        f"{prefix}{count}"
+        f"{prefix}{count}{dirty_mark}"
         for prefix, count in (
             ("U", state.unmerged),
             ("S", state.staged),
@@ -424,7 +479,8 @@ def state_parts(state: RepoState) -> list[str]:
         if count
     ]
     if state.stashed:
-        parts.append(f"stash {state.stashed}")
+        stash_mark = "+" if state.stashed_capped else ""
+        parts.append(f"stash {state.stashed}{stash_mark}")
     return parts
 
 

@@ -11,8 +11,11 @@ of it.
 
 from __future__ import annotations
 
+import heapq
 import time
+from collections import deque
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 from zlib import crc32
@@ -27,14 +30,19 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Static
 from textual.widgets.data_table import CellDoesNotExist, RowDoesNotExist
+from textual.worker import (
+    NoActiveWorker,
+    get_current_worker,  # pyright: ignore[reportUnknownVariableType]
+)
 
+from cboard2 import rowtext
 from cboard2.activity import branches
 from cboard2.board import group_families
 from cboard2.config import config_path
 from cboard2.configwrite import toggled, write_dormant
 from cboard2.discovery import main_name
-from cboard2.gitstate import NO_OPERATION, state_parts
-from cboard2.pull import pull_default
+from cboard2.gitstate import NO_OPERATION
+from cboard2.pull import Outcome, pull_default
 from cboard2.remote import (
     CHECKS_FAILING,
     ORIGIN,
@@ -42,12 +50,14 @@ from cboard2.remote import (
     origin_key,
     worst_checks,
 )
+from cboard2.rowtext import relative
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Container, Iterable, Sequence
 
+    from textual.worker import Worker
+
     from cboard2.board import Board, Row
-    from cboard2.pull import Outcome
     from cboard2.remote import PullRequest
 
 _COLUMNS = (
@@ -87,7 +97,13 @@ _WORKTREE_LIMIT = 5
 _FOLD_PREFIX = "fold:"
 """Prefix marking a table row key as a fold row rather than a repo path."""
 
-_HEAD_SUBJECT_MAX = 40
+_PULL_LIMIT = 4
+"""Pulls allowed in flight at once.
+
+Each one holds a git process for up to :data:`cboard2.pull.PULL_TIMEOUT`, so an
+unbounded burst would run one subprocess per repo the user pressed ``P`` on.
+"""
+
 _DETAIL_FILE_LIMIT = 40
 _DETAIL_ENTRY_LIMIT = 15
 _ACTIVITY_LIMIT = 200
@@ -157,9 +173,11 @@ def _most_recent(rows: Sequence[Row], limit: int) -> list[Row]:
     """Return the ``limit`` rows whose activity is newest.
 
     Chosen by activity rather than by position, so the cap keeps the same
-    worktrees under the name sort as under the recency sort.
+    worktrees under the name sort as under the recency sort. ``nlargest``
+    breaks ties the way a stable sort does, so equal timestamps keep the
+    order the family was listed in.
     """
-    return sorted(rows, key=lambda row: -row.active_at)[:limit]
+    return heapq.nlargest(limit, rows, key=lambda row: row.active_at)
 
 
 def filter_rows(
@@ -223,66 +241,48 @@ def _name_key(row: Row) -> tuple[str, int, str]:
     return main_name(state.main_git_dir).lower(), 1, state.name.lower()
 
 
-def relative(seconds: float) -> str:
-    """Render an age as ``just now``, ``42s ago``, ``5m ago`` and so on."""
-    span = max(0.0, seconds)
-    if span < 5:
-        return "just now"
-    if span < 60:
-        return f"{int(span)}s ago"
-    if span < 3600:
-        return f"{int(span // 60)}m ago"
-    if span < 86400:
-        return f"{int(span // 3600)}h ago"
-    return f"{int(span // 86400)}d ago"
-
-
 def branch_text(row: Row) -> Text:
     """Render the branch, marking a detached or unreadable repo."""
     state = row.state
     if not state.readable:
-        return Text("unreadable", style="red")
-    if state.detached:
-        return Text("(detached)", style="yellow")
-    return Text(state.branch or "—", style="" if state.branch else "dim")
+        style = "red"
+    elif state.detached:
+        style = "yellow"
+    else:
+        style = "" if state.branch else "dim"
+    return Text(rowtext.branch_text(row), style=style)
 
 
 def head_text(row: Row) -> Text:
     """Render HEAD's subject, truncated to the column width."""
-    subject = row.state.head_subject
-    if not subject:
-        return Text("—", style="dim")
-    if len(subject) > _HEAD_SUBJECT_MAX:
-        subject = subject[: _HEAD_SUBJECT_MAX - 1] + "…"
-    return Text(subject)
+    style = "" if row.state.head_subject else "dim"
+    return Text(rowtext.head_text(row), style=style)
 
 
 def state_text(row: Row) -> Text:
     """Render the halted operation, the dirty counts and the stash depth.
 
     Red for a repo that has stopped mid-operation or holds a conflict: that
-    one has to be finished before anything else in it can move.
+    one has to be finished before anything else in it can move. A repo whose
+    only mark is a stash reads dim, like a clean one.
     """
     state = row.state
-    parts = state_parts(state)
-    if not parts:
-        return Text("clean", style="dim")
     if state.halted:
-        return Text(" ".join(parts), style="red")
-    return Text(" ".join(parts), style="yellow" if state.dirty else "dim")
+        style = "red"
+    elif state.dirty:
+        style = "yellow"
+    else:
+        style = "dim"
+    return Text(rowtext.state_text(row), style=style)
 
 
 def ahead_behind_text(row: Row) -> Text:
     """Render the distance from upstream, or a dash when level."""
     state = row.state
     if state.ahead == 0 and state.behind == 0:
-        return Text("—", style="dim")
-    parts = [
-        f"{sign}{count}"
-        for sign, count in (("+", state.ahead), ("-", state.behind))
-        if count
-    ]
-    return Text(" ".join(parts), style="cyan" if state.ahead else "magenta")
+        return Text(rowtext.ahead_behind_text(row), style="dim")
+    style = "cyan" if state.ahead else "magenta"
+    return Text(rowtext.ahead_behind_text(row), style=style)
 
 
 _ORIGIN_COLORS = (
@@ -307,6 +307,16 @@ ahead and for the PR count, magenta for the unpushed count.
 """
 
 
+@lru_cache(maxsize=256)
+def _origin_color(key: str) -> str:
+    """Return the color for an origin key, hashing each distinct key once.
+
+    ``remote.origin`` moves only on the 300s remote read, so the same handful
+    of keys comes back on every row of every render.
+    """
+    return _ORIGIN_COLORS[crc32(key.encode()) % len(_ORIGIN_COLORS)]
+
+
 def origin_style(row: Row) -> str:
     """Return the color for this repo's origin owner, or "" when it has no origin.
 
@@ -318,31 +328,23 @@ def origin_style(row: Row) -> str:
     key = None if origin is None else origin_key(origin)
     if key is None:
         return ""
-    return _ORIGIN_COLORS[crc32(key.encode()) % len(_ORIGIN_COLORS)]
+    return _origin_color(key)
 
 
 def remote_text(row: Row) -> Text:
     """Render which branch has commits on the origin this clone has not pulled.
 
-    The checked-out branch is reported ahead of the default branch, because it
-    is the one the user is standing on. ``?`` and ``—`` are different answers:
-    the first means no remote read covered this repo, the second that it is
-    current.
-
-    A merged pull request outranks both behind markers: the work on this branch
-    is over, which is what the user does something about next.
+    A merged pull request reads green: the work on this branch is over, which
+    is what the user does something about next.
     """
     remote = row.remote
-    merged = remote.branch_merged_pr
-    if merged is not None:
-        return Text(f"PR #{merged.number} merged", style="green")
-    if remote.behind_branch:
-        return Text(f"behind {ORIGIN}/{remote.branch_remote}", style="yellow")
-    if not remote.default_known:
-        return Text("?", style="dim")
-    if remote.behind_default:
-        return Text(f"behind {remote.default_branch}", style="yellow")
-    return Text("—", style="dim")
+    if remote.branch_merged_pr is not None:
+        style = "green"
+    elif remote.behind_branch or (remote.default_known and remote.behind_default):
+        style = "yellow"
+    else:
+        style = "dim"
+    return Text(rowtext.remote_text(row), style=style)
 
 
 def pr_text(row: Row) -> Text:
@@ -352,32 +354,12 @@ def pr_text(row: Row) -> Text:
     this cell they have to act on themselves.
     """
     remote = row.remote
-    if not (remote.prs_known or remote.review_prs_known):
-        return Text("?", style="dim")
-    parts = [part for part in (own_pr_text(row), review_pr_text(row)) if part]
-    if not parts:
-        return Text("—", style="dim")
-    failing = worst_checks(remote.prs) == CHECKS_FAILING
-    return Text("  ".join(parts), style="red" if failing else "cyan")
-
-
-def own_pr_text(row: Row) -> str:
-    """Return the user's open PR count, its drafts and its worst checks state."""
-    remote = row.remote
-    if not remote.prs:
-        return ""
-    label = str(len(remote.prs))
-    drafts = remote.draft_count
-    if drafts:
-        label += f" ({drafts} draft{'s' if drafts > 1 else ''})"
-    mark = checks_mark(worst_checks(remote.prs))
-    return f"{label} {mark}" if mark else label
-
-
-def review_pr_text(row: Row) -> str:
-    """Return how many PRs are waiting on the user's review here."""
-    count = len(row.remote.review_prs)
-    return f"{count} to review" if count else ""
+    worst = worst_checks(remote.prs)
+    label = rowtext.pr_text(row, worst)
+    known = remote.prs_known or remote.review_prs_known
+    if not known or not (remote.prs or remote.review_prs):
+        return Text(label, style="dim")
+    return Text(label, style="red" if worst == CHECKS_FAILING else "cyan")
 
 
 def pr_content(pr: PullRequest, now: float) -> Content:
@@ -495,6 +477,20 @@ def painted_row(
     if isinstance(entry, Fold):
         return entry.key, fold_cells(entry)
     return str(entry.state.path), row_cells(entry, now, colors=colors)
+
+
+def worker_cancelled() -> bool:
+    """Return True when the running thread worker has been cancelled.
+
+    Textual's ``exclusive`` cancels the awaiting task, not the executor thread
+    already inside the callable, so a superseded worker runs to the end and its
+    result would overwrite the newer one.
+    """
+    try:
+        worker = cast("Worker[None]", get_current_worker())
+    except NoActiveWorker:
+        return False
+    return worker.is_cancelled
 
 
 def cursor_key(table: DataTable[str | Text]) -> str | None:
@@ -726,10 +722,7 @@ class DetailScreen(ModalScreen[None]):
 
     def entries_content(self, now: float) -> Content:
         """Return this repo's recent HEAD movements."""
-        entries = self._board.activity(limit=_ACTIVITY_LIMIT)
-        mine = [entry for entry in entries if entry.repo_path == self._row.state.path][
-            :_DETAIL_ENTRY_LIMIT
-        ]
+        mine = self._board.entries(self._row.state.path, limit=_DETAIL_ENTRY_LIMIT)
         if not mine:
             return Content.styled("no reflog entries", "dim")
         return _joined(
@@ -866,6 +859,9 @@ class CboardApp(App[None]):
         self._screen_keys: tuple[str, ...] = ()
         self._reorder = True
         self._pulling: set[Path] = set()
+        self._pull_queue: deque[tuple[Path, str | None]] = deque()
+        self._pull_steps: dict[Path, str] = {}
+        self._pulls_running: set[Path] = set()
         self._expanded: set[Path] = set()
 
     def compose(self) -> ComposeResult:
@@ -895,7 +891,13 @@ class CboardApp(App[None]):
         roots happens in here too, which is why it must not run on the UI
         thread.
         """
-        rows = self._board.refresh(force=force, rescan=rescan)
+        try:
+            rows = self._board.refresh(force=force, rescan=rescan)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.worker_failed, "poll", exc)
+            return
+        if worker_cancelled():
+            return
         self.call_from_thread(self.apply_rows, rows)
 
     @work(thread=True, exclusive=True, group="remote")
@@ -906,30 +908,68 @@ class CboardApp(App[None]):
         seconds, and sharing the exclusive poll worker would freeze the table
         for that long every interval.
         """
-        if self._board.read_remote(force=force):
+        try:
+            changed = self._board.read_remote(force=force)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.worker_failed, "remote read", exc)
+            return
+        if changed and not worker_cancelled():
             self.call_from_thread(self.poll)
 
+    def worker_failed(self, what: str, exc: BaseException) -> None:
+        """Report a worker's exception on the UI thread.
+
+        Textual runs with ``exit_on_error``, so an exception left to escape a
+        worker body closes the dashboard.
+        """
+        self.notify(f"{what} failed: {exc}", severity="error", timeout=10.0)
+
     def apply_rows(self, rows: Sequence[Row]) -> None:
-        """Store the newest readings and repaint."""
+        """Store the newest readings, forget what left disk, and repaint.
+
+        ``rows`` arrive in :meth:`cboard2.board.Board.refresh` order: sorted on
+        ``active_at``, newest first, with each family grouped. The recency sort
+        reuses that order rather than repeating it, so a caller handing rows
+        over in some other order gets them painted in that order.
+        """
         self._rows = list(rows)
+        self.forget_absent()
         self.render_rows()
 
+    def forget_absent(self) -> None:
+        """Drop expansion and pull state for repos the last scan no longer found.
+
+        Both sets otherwise grow for the length of the session: a family
+        toggled open and then deleted keeps its entry for good. A pull that is
+        queued or running keeps its entry either way, because that is what
+        stops a second ``P`` on the same repo.
+        """
+        self._expanded &= {row.state.family for row in self._rows}
+        busy = self._pulls_running | {path for path, _ in self._pull_queue}
+        self._pulling &= {row.state.path for row in self._rows} | busy
+
     def visible_rows(self) -> list[Row]:
-        """Return the rows the filters and sort leave on screen."""
+        """Return the rows the filters and sort leave on screen.
+
+        The recency order is skipped rather than run: :meth:`Board.refresh`
+        already sorted on ``active_at`` and grouped the families, and
+        :func:`filter_rows` only drops rows, which leaves both intact. The
+        other two orders re-sort, so they group again.
+        """
         _, window = _WINDOWS[self._window_index]
         since = None if window is None else self._clock() - window
-        return sort_rows(
-            filter_rows(
-                self._rows,
-                name=self._name_filter,
-                dirty_only=self._dirty_only,
-                unpushed_only=self._unpushed_only,
-                behind_only=self._behind_only,
-                prs_only=self._prs_only,
-                since=since,
-            ),
-            self._sort,
+        kept = filter_rows(
+            self._rows,
+            name=self._name_filter,
+            dirty_only=self._dirty_only,
+            unpushed_only=self._unpushed_only,
+            behind_only=self._behind_only,
+            prs_only=self._prs_only,
+            since=since,
         )
+        if self._sort == "recent":
+            return kept
+        return sort_rows(kept, self._sort)
 
     def render_rows(self) -> None:
         """Write the changed cells, and rebuild only when the row set changes.
@@ -1024,6 +1064,7 @@ class CboardApp(App[None]):
             parts.append(f"active <{label}")
         if folded:
             parts.append(f"{folded} worktrees folded")
+        parts.extend(f"{path.name} {step}" for path, step in self._pull_steps.items())
         read_at = self._board.remote_read_at
         if read_at is not None:
             parts.append(f"remote read {relative(self._clock() - read_at)}")
@@ -1105,8 +1146,14 @@ class CboardApp(App[None]):
             return
 
         self._pulling.add(path)
-        self.notify(f"pulling {row.state.name}…")
-        self.pull(path, row.remote.default_branch)
+        self._pull_queue.append((path, row.remote.default_branch))
+        if len(self._pulls_running) >= _PULL_LIMIT:
+            self.notify(
+                f"{row.state.name} is queued behind {len(self._pulls_running)} pulls"
+            )
+        else:
+            self.notify(f"pulling {row.state.name}…")
+        self.start_pulls()
 
     @work(thread=True, group="pull")
     def pull(self, path: Path, default_branch: str | None) -> None:
@@ -1114,13 +1161,50 @@ class CboardApp(App[None]):
 
         Not exclusive: pulling two repos one after the other should finish
         both, and a fetch already under way cannot be interrupted anyway.
+
+        ``finally`` rather than ``except`` alone: :meth:`pulled` is what
+        removes ``path`` from ``self._pulling``, so a path that skipped it
+        would refuse every later pull for the rest of the session.
         """
-        outcome = pull_default(path, default_branch=default_branch)
-        self.call_from_thread(self.pulled, path, outcome)
+        outcome = Outcome(ok=False, message="pull did not run")
+        try:
+            outcome = pull_default(
+                path,
+                default_branch=default_branch,
+                on_step=lambda step: self.call_from_thread(self.pull_step, path, step),
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome = Outcome(ok=False, message=f"pull could not run: {exc}")
+        finally:
+            self.call_from_thread(self.pulled, path, outcome)
+
+    def start_pulls(self) -> None:
+        """Start queued pulls up to :data:`_PULL_LIMIT`.
+
+        The count needs no lock: every caller runs on the UI thread, either as
+        a key action or as the callback a finished worker marshals back.
+        """
+        while self._pull_queue and len(self._pulls_running) < _PULL_LIMIT:
+            path, branch = self._pull_queue.popleft()
+            self._pulls_running.add(path)
+            self.pull(path, branch)
+
+    def pull_step(self, path: Path, step: str) -> None:
+        """Name the git step ``path`` has reached, in the header subtitle.
+
+        A pull can hold for minutes on a slow origin, and until this the
+        dashboard said only that one was running.
+        """
+        self._pull_steps[path] = step
+        self.render_rows()
 
     def pulled(self, path: Path, outcome: Outcome) -> None:
         """Report what the pull did and repoll, so the row catches up."""
         self._pulling.discard(path)
+        self._pulls_running.discard(path)
+        if self._pull_steps.pop(path, None) is not None:
+            self.render_rows()
+        self.start_pulls()
         label = f"{path.name}: {outcome.message}"
         if not outcome.ok:
             self.notify(label, severity="error", timeout=10.0)

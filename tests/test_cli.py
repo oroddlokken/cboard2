@@ -12,6 +12,8 @@ from conftest import git
 
 from cboard2.board import Board, Row
 from cboard2.cli import (
+    _TRUNCATED_NOTE,
+    as_dict,
     build_parser,
     cmd_busy,
     cmd_json,
@@ -22,12 +24,14 @@ from cboard2.cli import (
 )
 from cboard2.config import Config
 from cboard2.gitstate import RepoState
-from cboard2.remote import RemoteReader
+from cboard2.remote import PR_SEARCH_LIMIT, PullRequest, RemoteReader, RemoteState
 from cboard2.remotecache import load as load_cache
 from cboard2.remotecache import save as save_cache
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from conftest import RepoFactory
 
 NOW = 1_800_000_000.0
 """A fixed clock, for the tests that only check rendering."""
@@ -404,10 +408,13 @@ def test_json_always_carries_the_remote_object(
         "branch_known": False,
         "behind_branch": False,
         "branch_merged_pr": None,
+        "prs_row": str(git_repo),
         "prs_known": False,
         "prs": [],
+        "prs_truncated": False,
         "review_prs_known": False,
         "review_prs": [],
+        "review_prs_truncated": False,
     }
 
 
@@ -699,3 +706,110 @@ def test_busy_takes_the_two_remote_flags() -> None:
 
     assert parser.parse_args(["busy", "--remote"]).remote is True
     assert parser.parse_args(["busy", "--refresh"]).refresh is True
+
+
+def test_json_limit_bounds_the_row_count(
+    make_repo: RepoFactory,
+    tree: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for name in ("one", "two", "three"):
+        make_repo(name)
+    board = _board(tree)
+
+    assert cmd_json(board, None, now=NOW) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 3
+
+    assert cmd_json(board, None, now=NOW, limit=2) == 0
+
+    assert len(json.loads(capsys.readouterr().out)) == 2
+
+
+def test_the_limit_flag_defaults_off_and_rejects_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["json"]).limit is None
+    assert parser.parse_args(["json", "--limit", "5"]).limit == 5
+
+    with pytest.raises(SystemExit) as exit_info:
+        parser.parse_args(["json", "--limit", "0"])
+
+    assert exit_info.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+
+
+def test_json_emits_a_family_pr_arrays_once(
+    git_repo: Path,
+    worktree: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    head = git(git_repo, "rev-parse", "HEAD").strip()
+    gh = _RecordingGh(
+        {
+            "api": _graphql("main", head),
+            "search": json.dumps([_search_pr(4)]),
+            "review": json.dumps([_search_pr(9)]),
+        },
+    )
+    board = _remote_board(git_repo.parent, gh)
+    assert board.read_remote(force=True) is True
+
+    assert cmd_json(board, None, now=_now()) == 0
+    rows = {row["name"]: row for row in json.loads(capsys.readouterr().out)}
+
+    leader = rows[git_repo.name]["remote"]
+    follower = rows[worktree.name]["remote"]
+
+    assert leader["prs_row"] == str(git_repo)
+    assert [pr["number"] for pr in leader["prs"]] == [4]
+    assert [pr["number"] for pr in leader["review_prs"]] == [9]
+    assert follower["prs_row"] == str(git_repo)
+    assert follower["prs"] is None
+    assert follower["review_prs"] is None
+    assert follower["prs_known"] is True
+
+
+def _at_limit_row() -> Row:
+    """Build a row whose own-PR search filled PR_SEARCH_LIMIT."""
+    prs = tuple(
+        PullRequest(
+            number=number,
+            title=f"Change {number}",
+            url=f"https://github.com/acme/repo/pull/{number}",
+            draft=False,
+            updated_at=None,
+        )
+        for number in range(1, PR_SEARCH_LIMIT + 1)
+    )
+    state = RepoState(
+        path=Path("/tmp/repo"),  # noqa: S108 — never touched, only rendered
+        name="repo",
+        dormant=False,
+        readable=True,
+        polled_at=NOW,
+        branch="main",
+    )
+    remote = RemoteState(prs=prs, prs_known=True, prs_truncated=True)
+    return Row(state=state, moved_at=NOW, remote=remote)
+
+
+def test_json_flags_a_pr_search_that_hit_the_limit() -> None:
+    payload = json.loads(json.dumps(as_dict(_at_limit_row())))
+
+    assert len(payload["remote"]["prs"]) == PR_SEARCH_LIMIT
+    assert payload["remote"]["prs_truncated"] is True
+    assert payload["remote"]["review_prs_truncated"] is False
+
+
+def test_ls_notes_a_pr_search_that_hit_the_limit() -> None:
+    lines = format_table([_at_limit_row()], NOW, remote=True).splitlines()
+
+    assert f"{PR_SEARCH_LIMIT}-result limit" in lines[-1]
+    assert len(lines) == 3
+
+
+def test_ls_leaves_the_note_out_when_nothing_was_truncated() -> None:
+    assert _TRUNCATED_NOTE not in format_table([_dirty_row()], NOW)

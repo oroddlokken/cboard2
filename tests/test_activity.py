@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from conftest import RecordingRunner, git
 
+from cboard2 import activity
 from cboard2.activity import (
     ActivityReader,
     branches,
@@ -20,6 +21,8 @@ from cboard2.discovery import Repo
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 _REFLOG = """\
 HEAD@{1788524131}\tcheckout: moving from main to other\t2ddf989
@@ -171,6 +174,55 @@ def test_forget_absent_drops_the_cache(git_repo: Path) -> None:
     reader.entries(repo)
 
     assert runner.paths_for("reflog") == [git_repo]
+
+
+def test_entries_survives_the_cache_dropping_mid_call(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RecordingRunner({"reflog": _REFLOG})
+    reader = ActivityReader(runner=runner)
+    repo = _repo(git_repo)
+    cached = reader.entries(repo)
+    real = activity.log_mtime
+
+    class DroppingMtime(float):
+        """An mtime that drops the cache when compared, as the poll thread can."""
+
+        def __eq__(self, other: object) -> bool:
+            reader.forget_absent([])
+            return isinstance(other, float) and float(self) == other
+
+        __hash__ = float.__hash__
+
+    def drop_while_comparing(root: Path) -> float | None:
+        mtime = real(root)
+        return None if mtime is None else DroppingMtime(mtime)
+
+    monkeypatch.setattr(activity, "log_mtime", drop_while_comparing)
+
+    assert cached
+    assert reader.entries(repo) == cached
+
+
+def test_entries_returns_empty_when_the_repo_is_forgotten_mid_call(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RecordingRunner({"reflog": _REFLOG})
+    reader = ActivityReader(runner=runner)
+    repo = _repo(git_repo)
+    reader.entries(repo)
+    runner.outputs["reflog"] = ""
+    real = activity.log_mtime
+
+    def drop_then_stat(root: Path) -> float | None:
+        reader.forget_absent([])
+        return real(root)
+
+    monkeypatch.setattr(activity, "log_mtime", drop_then_stat)
+
+    assert reader.entries(repo) == []
 
 
 def test_branches_lists_local_heads_newest_first(git_repo: Path) -> None:
