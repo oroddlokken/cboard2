@@ -4,8 +4,9 @@ The shape it carries is :class:`cboard2.remote.Cached`.
 
 Only what the network told us is stored, keyed by ``owner/name`` on GitHub and
 by the origin URL elsewhere: the default branch and its tip, the tip of each
-branch the read asked about by name, and the pull requests the user authored or
-was asked to review with each one's checks state. The two behind markers are
+branch the read asked about by name, the merged pull request that came off each
+of those branches, and the pull requests the user authored or was asked to
+review with each one's checks state. The two behind markers are
 deliberately absent — they are derived from the local refs, so a cached copy
 would keep reporting ``behind main`` after a pull.
 :meth:`cboard2.remote.RemoteReader.refresh_local` recomputes them on load.
@@ -23,7 +24,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from cboard2.remote import CHECKS_UNKNOWN, Cached, PullRequest
+from cboard2.remote import CHECKS_UNKNOWN, Cached, MergedPR, PullRequest
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
 _ENV_CACHE_PATH = "CBOARD2_CACHE"
 """Env var pointing at an alternate cache file, for tests and power users."""
 
-VERSION = 3
+VERSION = 4
 """Schema version. A file written by another version is read as a cold cache.
 
 Bumped whenever a stored field is added or changes meaning, so a file from an
@@ -82,6 +83,7 @@ def load(path: Path) -> Cached | None:
     branches: dict[str, Mapping[str, str]] = {}
     prs: dict[str, tuple[PullRequest, ...]] = {}
     review: dict[str, tuple[PullRequest, ...]] = {}
+    merged: dict[str, Mapping[str, MergedPR]] = {}
     for key, entry in _as_dict(body.get("repos")).items():
         fields = _as_dict(entry)
         branch = fields.get("default_branch")
@@ -97,6 +99,9 @@ def load(path: Path) -> Cached | None:
         awaiting = _requests(fields.get("review_prs"))
         if awaiting:
             review[key] = awaiting
+        landed = _merged(fields.get("merged"))
+        if landed:
+            merged[key] = landed
 
     return Cached(
         read_at=float(read_at),
@@ -106,6 +111,7 @@ def load(path: Path) -> Cached | None:
         prs_known=body.get("prs_known") is True,
         review_prs=review,
         review_prs_known=body.get("review_prs_known") is True,
+        merged=merged,
     )
 
 
@@ -129,7 +135,8 @@ def save(path: Path, cached: Cached) -> bool:
                 set(cached.defaults)
                 | set(cached.branches)
                 | set(cached.prs)
-                | set(cached.review_prs),
+                | set(cached.review_prs)
+                | set(cached.merged),
             )
         },
     }
@@ -165,6 +172,9 @@ def _entry(cached: Cached, key: str) -> dict[str, object]:
         "branches": dict(cached.branches.get(key, {})),
         "prs": [_stored(pr) for pr in cached.prs.get(key, ())],
         "review_prs": [_stored(pr) for pr in cached.review_prs.get(key, ())],
+        "merged": {
+            name: _stored_merged(pr) for name, pr in cached.merged.get(key, {}).items()
+        },
     }
 
 
@@ -178,6 +188,36 @@ def _stored(pr: PullRequest) -> dict[str, object]:
         "updated_at": pr.updated_at,
         "checks": pr.checks,
     }
+
+
+def _stored_merged(pr: MergedPR) -> dict[str, object]:
+    """Return one merged pull request as the fields the file carries."""
+    return {
+        "number": pr.number,
+        "title": pr.title,
+        "url": pr.url,
+        "merged_at": pr.merged_at,
+    }
+
+
+def _merged(value: object) -> dict[str, MergedPR]:
+    """Read one remote's stored merged PRs, skipping any entry missing a number."""
+    found: dict[str, MergedPR] = {}
+    for branch, entry in _as_dict(value).items():
+        fields = _as_dict(entry)
+        number = fields.get("number")
+        if not branch or not isinstance(number, int) or isinstance(number, bool):
+            continue
+        merged_at = fields.get("merged_at")
+        found[branch] = MergedPR(
+            number=number,
+            title=_text(fields.get("title")),
+            url=_text(fields.get("url")),
+            merged_at=float(merged_at)
+            if isinstance(merged_at, (int, float)) and not isinstance(merged_at, bool)
+            else None,
+        )
+    return found
 
 
 def _tips(value: object) -> dict[str, str]:

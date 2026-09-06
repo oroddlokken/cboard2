@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from cboard2.remote import Cached, PullRequest
+from cboard2.remote import Cached, MergedPR, PullRequest
 from cboard2.remotecache import VERSION, cache_path, load, save
 
 if TYPE_CHECKING:
@@ -65,6 +65,32 @@ def test_cache_path_falls_back_to_xdg_then_home(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
 
     assert cache_path() == tmp_path / "cboard2" / "remote.json"
+
+
+def test_a_merged_pr_survives_a_round_trip(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    merged = MergedPR(
+        number=12,
+        title="Change 12",
+        url="https://github.com/acme/one/pull/12",
+        merged_at=READ_AT - 600.0,
+    )
+
+    save(target, replace(_cached(), merged={"acme/one": {"fix": merged}}))
+    loaded = load(target)
+
+    assert loaded is not None
+    assert loaded.merged == {"acme/one": {"fix": merged}}
+
+
+def test_a_read_with_no_merged_pr_loads_an_empty_mapping(tmp_path: Path) -> None:
+    target = tmp_path / "remote.json"
+    save(target, _cached())
+
+    loaded = load(target)
+
+    assert loaded is not None
+    assert loaded.merged == {}
 
 
 def test_a_read_survives_a_round_trip(tmp_path: Path) -> None:

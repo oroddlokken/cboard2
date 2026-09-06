@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from cboard2.board import Row
-    from cboard2.remote import PullRequest
+    from cboard2.remote import MergedPR, PullRequest
 
 _BUSY_DEFAULT = 30.0
 """Seconds ``busy`` looks back over when no window is given."""
@@ -216,10 +216,23 @@ def _remote_dict(row: Row) -> dict[str, object]:
         "branch_sha": remote.branch_sha,
         "branch_known": remote.branch_known,
         "behind_branch": remote.behind_branch,
+        "branch_merged_pr": _merged_dict(remote.branch_merged_pr),
         "prs_known": remote.prs_known,
         "prs": [_pr_dict(pr) for pr in remote.prs],
         "review_prs_known": remote.review_prs_known,
         "review_prs": [_pr_dict(pr) for pr in remote.review_prs],
+    }
+
+
+def _merged_dict(pr: MergedPR | None) -> dict[str, object] | None:
+    """Return the merged PR of the checked-out branch, or None when there is none."""
+    if pr is None:
+        return None
+    return {
+        "number": pr.number,
+        "title": pr.title,
+        "url": pr.url,
+        "merged_at": pr.merged_at,
     }
 
 
@@ -268,9 +281,12 @@ def remote_text(row: Row) -> str:
     """Return which branch has commits on the origin this clone has not pulled.
 
     The checked-out branch is reported ahead of the default branch, because it
-    is the one the user is standing on.
+    is the one the user is standing on, and a merged pull request on it
+    outranks both behind markers.
     """
     state = row.remote
+    if state.branch_merged_pr is not None:
+        return f"PR #{state.branch_merged_pr.number} merged"
     if state.behind_branch:
         return f"behind {ORIGIN}/{state.branch_remote}"
     if not state.default_known:

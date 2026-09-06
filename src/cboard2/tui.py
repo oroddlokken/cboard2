@@ -328,8 +328,14 @@ def remote_text(row: Row) -> Text:
     is the one the user is standing on. ``?`` and ``—`` are different answers:
     the first means no remote read covered this repo, the second that it is
     current.
+
+    A merged pull request outranks both behind markers: the work on this branch
+    is over, which is what the user does something about next.
     """
     remote = row.remote
+    merged = remote.branch_merged_pr
+    if merged is not None:
+        return Text(f"PR #{merged.number} merged", style="green")
     if remote.behind_branch:
         return Text(f"behind {ORIGIN}/{remote.branch_remote}", style="yellow")
     if not remote.default_known:
@@ -598,9 +604,10 @@ class DetailScreen(ModalScreen[None]):
     def remote_content(self) -> Content:
         """Return what the origin says about this repo's branches.
 
-        The checked-out branch comes first when it lags, and the default
-        branch's line follows either way: a feature branch behind its own
-        remote copy says nothing about whether ``main`` here is current.
+        The checked-out branch comes first when its PR has merged or when it
+        lags, and the default branch's line follows either way: a feature
+        branch behind its own remote copy says nothing about whether ``main``
+        here is current.
         """
         remote = self._row.remote
         if remote.origin is None:
@@ -609,6 +616,17 @@ class DetailScreen(ModalScreen[None]):
         label = (remote.slug or remote.origin, color)
         if not remote.default_known:
             return Content.assemble(label, "  ", ("not read", "dim"))
+        merged = remote.branch_merged_pr
+        if merged is not None:
+            return Content.assemble(
+                label,
+                "  ",
+                (f"{remote.branch_remote} was merged in #{merged.number}", "green"),
+                "\n",
+                (f"{merged.title}  {merged.url}", "dim"),
+                "\n",
+                self._default_line(),
+            )
         if remote.behind_branch:
             return Content.assemble(
                 label,

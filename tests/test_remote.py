@@ -28,6 +28,7 @@ from cboard2.remote import (
     parse_branch_tips,
     parse_defaults,
     parse_heads,
+    parse_merged_prs,
     parse_prs,
     parse_ref_shas,
     parse_slug,
@@ -1128,15 +1129,23 @@ def test_build_query_binds_each_branch_to_a_variable() -> None:
 
     query = build_query(("acme/one", "acme/two"), pairs)
 
-    assert query.startswith("query($b0: String!, $b1: String!) {")
+    assert query.startswith(
+        "query($b0: String!, $h0: String!, $b1: String!, $h1: String!) {",
+    )
     assert "b0: ref(qualifiedName: $b0)" in query
     assert "b1: ref(qualifiedName: $b1)" in query
+    assert "m0: pullRequests(headRefName: $h0, states: MERGED" in query
+    assert "m1: pullRequests(headRefName: $h1, states: MERGED" in query
     assert 'odd"name' not in query
     assert branch_variables(pairs) == (
         "-f",
         "b0=refs/heads/fix",
         "-f",
+        "h0=fix",
+        "-f",
         'b1=refs/heads/odd"name',
+        "-f",
+        'h1=odd"name',
     )
 
 
@@ -1150,6 +1159,92 @@ def test_parse_branch_tips_round_trips_a_built_query() -> None:
     text = _graphql_refs(("main", LOCAL_SHA), b0=REMOTE_SHA)
 
     assert parse_branch_tips(text, slugs, pairs) == {"acme/one": {"fix": REMOTE_SHA}}
+
+
+def _merged_node(number: int) -> dict[str, object]:
+    """Build one ``pullRequests`` connection carrying a single merged PR."""
+    return {
+        "nodes": [
+            {
+                "number": number,
+                "title": f"Change {number}",
+                "url": f"https://github.com/acme/one/pull/{number}",
+                "mergedAt": "2027-01-14T09:00:00Z",
+            },
+        ],
+    }
+
+
+def _merged_graphql(number: int = 12) -> str:
+    """Build a one-repo answer whose asked-about branch carries a merged PR."""
+    return _graphql_entry(
+        ("main", REMOTE_SHA),
+        b0={"target": {"oid": REMOTE_SHA}},
+        m0=_merged_node(number),
+    )
+
+
+def test_parse_merged_prs_reads_the_pr_of_each_branch_that_has_one() -> None:
+    slugs = ("acme/one",)
+    pairs = [("acme/one", "fix"), ("acme/one", "live")]
+    text = _graphql_entry(m0=_merged_node(12), m1={"nodes": []})
+
+    found = parse_merged_prs(text, slugs, pairs)
+
+    assert set(found["acme/one"]) == {"fix"}
+    merged = found["acme/one"]["fix"]
+    assert merged.number == 12
+    assert merged.url == "https://github.com/acme/one/pull/12"
+    assert merged.merged_at is not None
+
+
+def test_a_branch_whose_pr_merged_reports_it(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    gh = FakeGh(graphql=_merged_graphql(), prs="[]")
+    reader = RemoteReader(runner=_branch_git(repo, merge_base=""), gh=gh)
+
+    assert reader.read([repo], NOW) is True
+
+    merged = reader.cached(repo.path).branch_merged_pr
+    assert merged is not None
+    assert merged.number == 12
+    assert merged.title == "Change 12"
+
+
+def test_a_checkout_of_the_default_branch_reports_no_merged_pr(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "one")
+    gh = FakeGh(graphql=_merged_graphql(), prs="[]")
+    reader = RemoteReader(runner=_branch_git(repo, branch="main", merge_base=""), gh=gh)
+
+    reader.read([repo], NOW)
+
+    assert reader.cached(repo.path).branch_merged_pr is None
+
+
+def test_moving_off_the_merged_branch_clears_it_before_the_next_read(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path, "one")
+    answers: dict[Path, dict[str, str | None]] = {
+        repo.path: {
+            "remote": "https://github.com/acme/one.git\n",
+            "worktree": _listing((repo.path, "fix")),
+            "for-each-ref": _heads(
+                ("main", REMOTE_SHA, "origin", "refs/heads/main"),
+                ("fix", LOCAL_SHA, "origin", "refs/heads/fix"),
+            ),
+            "merge-base": "",
+        },
+    }
+    gh = FakeGh(graphql=_merged_graphql(), prs="[]")
+    reader = RemoteReader(runner=FakeGit(answers), gh=gh)
+    reader.read([repo], NOW)
+    assert reader.cached(repo.path).branch_merged_pr is not None
+
+    answers[repo.path]["worktree"] = _listing((repo.path, "main"))
+    reader.refresh_local([repo])
+
+    assert reader.cached(repo.path).branch_merged_pr is None
 
 
 def _branch_git(

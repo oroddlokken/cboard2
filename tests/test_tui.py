@@ -17,7 +17,7 @@ from cboard2.board import Board, Row, group_families
 from cboard2.config import Config, load_config
 from cboard2.gitstate import Poller, RepoState
 from cboard2.pull import Outcome
-from cboard2.remote import UNKNOWN, PullRequest, RemoteState
+from cboard2.remote import UNKNOWN, MergedPR, PullRequest, RemoteState
 from cboard2.tui import (
     _COLUMNS,
     ActivityScreen,
@@ -846,6 +846,25 @@ def test_remote_column_separates_behind_current_and_unknown() -> None:
     assert remote_text(_row("a", remote=BEHIND)).plain == "behind main"
     assert remote_text(_row("b", remote=CURRENT)).plain == "—"
     assert remote_text(_row("c")).plain == "?"
+
+
+MERGED_BRANCH = replace(
+    BEHIND_BRANCH,
+    branch_merged_pr=MergedPR(
+        number=12,
+        title="Fix the thing",
+        url="https://github.com/acme/repo/pull/12",
+        merged_at=1_799_999_940.0,
+    ),
+)
+
+
+def test_remote_column_reports_a_merged_pr_ahead_of_both_behind_markers() -> None:
+    behind_too = replace(MERGED_BRANCH, behind_default=True)
+
+    assert remote_text(_row("a", remote=MERGED_BRANCH)).plain == "PR #12 merged"
+    assert remote_text(_row("b", remote=behind_too)).plain == "PR #12 merged"
+    assert str(remote_text(_row("c", remote=MERGED_BRANCH)).style) == "green"
 
 
 def test_remote_column_names_the_branch_ahead_of_the_default() -> None:
@@ -1690,6 +1709,20 @@ def test_the_detail_screen_lists_the_prs_awaiting_review(tmp_path: Path) -> None
     assert "#12" in text
     assert "✗ failing" in text
     assert screen.prs_content(0.0).plain == "none open"
+
+
+def test_the_detail_screen_names_the_pr_that_merged_this_branch(
+    tmp_path: Path,
+) -> None:
+    screen = DetailScreen(
+        _row("repo", remote=MERGED_BRANCH), _board(tmp_path), clock=lambda: 0.0
+    )
+
+    text = screen.remote_content().plain
+
+    assert "fix was merged in #12" in text
+    assert "https://github.com/acme/repo/pull/12" in text
+    assert "main is current" in text
 
 
 def test_an_unread_review_search_says_so(tmp_path: Path) -> None:

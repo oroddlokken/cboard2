@@ -39,7 +39,7 @@ Each row is one repo:
 | Last commit | Age of that commit |
 | State | `S2 M1 ?3` is two staged files, one modified, three untracked. `U2` is two conflicted paths, `rebase` a rebase you stopped in the middle of, `stash 2` two entries on the stash. Red means something is halted and waiting on you |
 | `↑↓` | Commits ahead of and behind the upstream |
-| Remote, PR | Which branch the origin has moved on, and the pull requests in play. `behind origin/fix` is the checked-out branch, `behind main` the default one. `2 ✗  3 to review` is two PRs of yours with one failing its checks, and three waiting on your review. PRs come from GitHub; the branches come from any origin |
+| Remote, PR | Which branch the origin has moved on, and the pull requests in play. `behind origin/fix` is the checked-out branch, `behind main` the default one. `PR #12 merged` is a checked-out branch whose pull request has already landed, and it outranks either behind marker. `2 ✗  3 to review` is two PRs of yours with one failing its checks, and three waiting on your review. PRs come from GitHub; the branches come from any origin |
 | Active | When you last touched the repo |
 
 Active counts working-tree edits, not just commits, so an hour of uncommitted
@@ -128,10 +128,11 @@ movement with a timestamp and a verb. Working-tree edits touch nothing under
 
 The remote columns come from two `gh search prs` calls — one for the PRs you
 wrote, one for the PRs awaiting your review — and one batched GraphQL query for
-default branches, checked-out branches and each PR's checks rollup. An origin that
+default branches, checked-out branches, the merged PR of each checked-out branch
+and each PR's checks rollup. An origin that
 is not on github.com gets `git ls-remote --symref origin HEAD` instead, with the
 same branches named as extra refs, so a self-hosted or GitLab remote still
-reports both; those repos show no PRs. cboard2 never fetches: rewriting
+reports both; those repos show no PRs and no merged marker. cboard2 never fetches: rewriting
 `refs/remotes/origin/*` under you would change what your next `git log` shows.
 
 A checkout is compared against the branch its upstream names, or against the

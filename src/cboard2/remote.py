@@ -9,8 +9,9 @@ would change what their next ``git log`` shows.
 Three network calls cover every repo. Two ``gh search prs`` calls return every
 open PR the user authored and every one waiting on their review, anywhere; one
 batched GraphQL query then returns each repo's default branch and its tip, the
-tip of whatever branch is checked out in each of its worktrees, and the checks
-rollup of every PR the searches found on a watched repo. Measured on the
+tip of whatever branch is checked out in each of its worktrees, the merged pull
+request that came off each of those branches, and the checks rollup of every PR
+the searches found on a watched repo. Measured on the
 author's machine: 66 repos in one query took 4.4s, against 1.7s per repo for
 ``git ls-remote`` — which is why the query is batched and why the read runs on
 its own slow interval rather than the 2s poll tick.
@@ -71,8 +72,10 @@ if TYPE_CHECKING:
         dict[str, tuple[str, str]],
         dict[str, dict[str, str]],
         dict[str, dict[int, str]],
+        dict[str, dict[str, MergedPR]],
     ]
-    """One chunk's answers: its defaults, its branch tips and its checks states."""
+    """One chunk's answers: its defaults, its branch tips, its checks states and
+    the merged pull request of each branch it asked about."""
 
 GH_TIMEOUT = 30.0
 """Seconds before a gh call is abandoned and its repos left unknown."""
@@ -214,6 +217,20 @@ class PullRequest:
     """
 
 
+@dataclass(frozen=True, slots=True)
+class MergedPR:
+    """A merged pull request whose head branch is checked out here.
+
+    Found by head branch name rather than by author, so a branch someone else
+    merged for the user reports too.
+    """
+
+    number: int
+    title: str
+    url: str
+    merged_at: float | None = None
+
+
 def worst_checks(prs: Sequence[PullRequest]) -> str:
     """Return the state of the PR most worth looking at among ``prs``.
 
@@ -288,6 +305,13 @@ class RemoteState:
     Derived from the local refs on the same clock as ``behind_default``.
     """
 
+    branch_merged_pr: MergedPR | None = None
+    """The merged pull request that came off ``branch_remote``, if there is one.
+
+    None where no merged PR names that branch, where the checkout is the
+    default branch, and where no read reached the origin.
+    """
+
     @property
     def draft_count(self) -> int:
         """How many of the open PRs are drafts."""
@@ -301,6 +325,9 @@ _NO_DEFAULTS: Mapping[str, tuple[str, str]] = MappingProxyType({})
 _NO_BRANCHES: Mapping[str, Mapping[str, str]] = MappingProxyType({})
 _NO_PRS: Mapping[str, tuple[PullRequest, ...]] = MappingProxyType({})
 """Empty defaults for :class:`Cached`, immutable so the dataclass accepts them."""
+
+_NO_MERGED: Mapping[str, Mapping[str, MergedPR]] = MappingProxyType({})
+"""No merged pull request for any branch, for a read that reached no origin."""
 
 _NO_CHECKS: Mapping[str, Sequence[int]] = MappingProxyType({})
 """No pull requests to ask about, for a read whose searches both failed."""
@@ -338,6 +365,13 @@ class Cached:
     review_prs: Mapping[str, tuple[PullRequest, ...]] = _NO_PRS
     review_prs_known: bool = False
     """The same pair for the PRs waiting on the user's review."""
+
+    merged: Mapping[str, Mapping[str, MergedPR]] = _NO_MERGED
+    """Slug to the merged PR of each branch the read asked about by name.
+
+    A merged PR stays merged, so a stored answer is as good as a fresh one
+    until the checkout moves.
+    """
 
 
 def run_gh(args: Sequence[str]) -> str | None:
@@ -544,12 +578,13 @@ def build_query(
     """Return a GraphQL query for each slug's branches and pull request checks.
 
     ``pairs`` are the ``(slug, branch)`` lookups to add, each nested under its
-    slug as a ``b<index>`` alias reading the variable of the same name.
+    slug as a ``b<index>`` alias reading the variable of the same name, beside
+    an ``m<index>`` alias for the merged pull request that came off that branch.
     ``checks`` are the ``(slug, number)`` pull requests whose head commit's
     rollup to ask for, as a ``c<index>`` alias. :func:`parse_defaults`,
-    :func:`parse_branch_tips` and :func:`parse_check_states` read the indexes
-    back out, and the slug's own index is its alias because a slug is not a
-    legal GraphQL name.
+    :func:`parse_branch_tips`, :func:`parse_merged_prs` and
+    :func:`parse_check_states` read the indexes back out, and the slug's own
+    index is its alias because a slug is not a legal GraphQL name.
 
     A PR number is written into the query text rather than bound, because it
     reaches here as an ``int`` off a JSON parse. A branch name is a string the
@@ -557,8 +592,15 @@ def build_query(
     """
     nested: dict[str, list[str]] = {}
     for index, (slug, _) in enumerate(pairs):
-        nested.setdefault(slug, []).append(
-            f"b{index}: ref(qualifiedName: $b{index}) {{ target {{ oid }} }}",
+        nested.setdefault(slug, []).extend(
+            (
+                f"b{index}: ref(qualifiedName: $b{index}) {{ target {{ oid }} }}",
+                (
+                    f"m{index}: pullRequests(headRefName: $h{index}, states: MERGED, "
+                    "first: 1, orderBy: {field: UPDATED_AT, direction: DESC}) "
+                    "{ nodes { number title url mergedAt } }"
+                ),
+            ),
         )
     for index, (slug, number) in enumerate(checks):
         nested.setdefault(slug, []).append(
@@ -576,20 +618,24 @@ def build_query(
     ]
     header = ""
     if pairs:
-        declared = ", ".join(f"$b{index}: String!" for index in range(len(pairs)))
+        declared = ", ".join(
+            f"$b{index}: String!, $h{index}: String!" for index in range(len(pairs))
+        )
         header = f"query({declared}) "
     return header + "{\n" + "\n".join(lines) + "\n}"
 
 
 def branch_variables(pairs: Sequence[tuple[str, str]]) -> tuple[str, ...]:
-    """Return the gh arguments binding each pair's branch to its query variable.
+    """Return the gh arguments binding each pair's branch to its query variables.
 
     Bound as a variable rather than written into the query text: git allows a
-    double quote in a branch name, and the query is a string.
+    double quote in a branch name, and the query is a string. Each pair takes
+    two, because ``ref`` reads a qualified ref and ``headRefName`` the bare
+    name.
     """
     args: list[str] = []
     for index, (_, branch) in enumerate(pairs):
-        args += ["-f", f"b{index}=refs/heads/{branch}"]
+        args += ["-f", f"b{index}=refs/heads/{branch}", "-f", f"h{index}={branch}"]
     return tuple(args)
 
 
@@ -637,6 +683,50 @@ def parse_branch_tips(
         if isinstance(oid, str):
             found.setdefault(slug, {})[branch] = oid
     return found
+
+
+def parse_merged_prs(
+    text: str,
+    slugs: Sequence[str],
+    pairs: Sequence[tuple[str, str]],
+) -> dict[str, dict[str, MergedPR]]:
+    """Map each pair's slug and branch to the merged PR that came off that branch.
+
+    The query asks for the most recently updated one, so a branch merged more
+    than once reports its latest. A branch with none is left out.
+    """
+    payload = _as_dict(_load(text))
+    data = _as_dict(payload.get("data"))
+    if not data:
+        return {}
+
+    aliases = {slug: f"r{index}" for index, slug in enumerate(slugs)}
+    found: dict[str, dict[str, MergedPR]] = {}
+    for index, (slug, branch) in enumerate(pairs):
+        repo = _as_dict(data.get(aliases.get(slug, "")))
+        merged = _merged_pr(_as_dict(repo.get(f"m{index}")))
+        if merged is not None:
+            found.setdefault(slug, {})[branch] = merged
+    return found
+
+
+def _merged_pr(entry: dict[str, object]) -> MergedPR | None:
+    """Read one ``pullRequests`` connection's first node, or None when it has none."""
+    nodes = entry.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return None
+    node = _as_dict(cast("list[object]", nodes)[0])
+    number = node.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return None
+    title = node.get("title")
+    url = node.get("url")
+    return MergedPR(
+        number=number,
+        title=title if isinstance(title, str) else "",
+        url=url if isinstance(url, str) else "",
+        merged_at=_timestamp(node.get("mergedAt")),
+    )
 
 
 def parse_check_states(
@@ -857,6 +947,7 @@ class RemoteReader:
             origins=origins,
             defaults=cached.defaults,
             tips=cached.branches,
+            merged=cached.merged,
             prs=cached.prs if cached.prs_known else None,
             review=cached.review_prs if cached.review_prs_known else None,
             checkouts=checkouts,
@@ -898,7 +989,7 @@ class RemoteReader:
         slugs = github_slugs(origins.values())
         asked = check_lookups(slugs, prs, review)
 
-        defaults, tips, states = self._defaults(slugs, wanted, asked)
+        defaults, tips, states, merged = self._defaults(slugs, wanted, asked)
         probed, probed_tips = self._probe(repos, origins, wanted)
         defaults.update(probed)
         tips.update(probed_tips)
@@ -910,6 +1001,7 @@ class RemoteReader:
             origins=origins,
             defaults=defaults,
             tips=tips,
+            merged=merged,
             prs=prs,
             review=review,
             checkouts=checkouts,
@@ -917,7 +1009,7 @@ class RemoteReader:
         )
         self._read_at = now
         self._apply(self._covered(repos), lines, checkouts)
-        self._store(defaults, tips, prs, review, now)
+        self._store(defaults, tips, merged, prs=prs, review=review, now=now)
         return True
 
     def _rebuild(
@@ -927,6 +1019,7 @@ class RemoteReader:
         origins: Mapping[Path, str],
         defaults: Mapping[str, tuple[str, str]],
         tips: Mapping[str, Mapping[str, str]],
+        merged: Mapping[str, Mapping[str, MergedPR]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
         checkouts: Mapping[Path, str],
@@ -938,6 +1031,7 @@ class RemoteReader:
                 origin=origins.get(repo.path),
                 defaults=defaults,
                 tips=tips,
+                merged=merged,
                 prs=prs,
                 review=review,
                 branch=checkouts.get(repo.path),
@@ -950,6 +1044,8 @@ class RemoteReader:
         self,
         defaults: dict[str, tuple[str, str]],
         tips: dict[str, dict[str, str]],
+        merged: dict[str, dict[str, MergedPR]],
+        *,
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
         now: float,
@@ -966,6 +1062,7 @@ class RemoteReader:
                 read_at=now,
                 defaults=defaults,
                 branches=tips,
+                merged=merged,
                 prs={} if prs is None else prs,
                 prs_known=prs is not None,
                 review_prs={} if review is None else review,
@@ -1058,6 +1155,7 @@ class RemoteReader:
                 branch_sha=None,
                 branch_known=False,
                 behind_branch=False,
+                branch_merged_pr=None,
             )
         return replace(
             state,
@@ -1071,6 +1169,7 @@ class RemoteReader:
         origin: str | None,
         defaults: Mapping[str, tuple[str, str]],
         tips: Mapping[str, Mapping[str, str]],
+        merged: Mapping[str, Mapping[str, MergedPR]],
         prs: Mapping[str, tuple[PullRequest, ...]] | None,
         review: Mapping[str, tuple[PullRequest, ...]] | None,
         branch: str | None,
@@ -1111,6 +1210,11 @@ class RemoteReader:
                 None if remote_branch is None else tips.get(key, {}).get(remote_branch)
             ),
             branch_known=remote_branch is not None,
+            branch_merged_pr=(
+                None
+                if remote_branch is None
+                else merged.get(key, {}).get(remote_branch)
+            ),
         )
 
     def _behind(
@@ -1286,10 +1390,11 @@ class RemoteReader:
         dict[str, tuple[str, str]],
         dict[str, dict[str, str]],
         dict[str, dict[int, str]],
+        dict[str, dict[str, MergedPR]],
     ]:
-        """Run the batched query and merge each chunk's branches and checks states."""
+        """Run the batched query and merge every chunk's answers into one set."""
         if not slugs:
-            return {}, {}, {}
+            return {}, {}, {}, {}
         chunks = [
             tuple(slugs[start : start + BATCH_SIZE])
             for start in range(0, len(slugs), BATCH_SIZE)
@@ -1305,21 +1410,24 @@ class RemoteReader:
                 ("api", "graphql", "-f", f"query={query}", *branch_variables(pairs)),
             )
             if out is None:
-                return {}, {}, {}
+                return {}, {}, {}, {}
             return (
                 parse_defaults(out, chunk),
                 parse_branch_tips(out, chunk, pairs),
                 parse_check_states(out, chunk, checks),
+                parse_merged_prs(out, chunk, pairs),
             )
 
-        merged: dict[str, tuple[str, str]] = {}
+        defaults: dict[str, tuple[str, str]] = {}
         tips: dict[str, dict[str, str]] = {}
         states: dict[str, dict[int, str]] = {}
-        for found, branches, rollups in self._map(lookup, chunks):
-            merged.update(found)
+        merged: dict[str, dict[str, MergedPR]] = {}
+        for found, branches, rollups, landed in self._map(lookup, chunks):
+            defaults.update(found)
             tips.update(branches)
             states.update(rollups)
-        return merged, tips, states
+            merged.update(landed)
+        return defaults, tips, states, merged
 
     def _prs(self, args: Sequence[str]) -> dict[str, tuple[PullRequest, ...]] | None:
         """Run one PR search across every repo, or return None on failure."""

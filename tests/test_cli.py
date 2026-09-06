@@ -245,13 +245,29 @@ def _graphql(
     oid: str,
     tip: str | None = None,
     checks: dict[str, str] | None = None,
+    merged: int | None = None,
 ) -> str:
-    """Build a one-repo answer, with ``tip`` as ``b0`` and ``checks`` as ``c<n>``."""
+    """Build a one-repo answer, with ``tip`` as ``b0`` and ``checks`` as ``c<n>``.
+
+    ``merged`` is the number of the PR that came off the asked-about branch,
+    answered as ``m0``.
+    """
     entry: dict[str, object] = {
         "defaultBranchRef": {"name": branch, "target": {"oid": oid}},
     }
     if tip is not None:
         entry["b0"] = {"target": {"oid": tip}}
+    if merged is not None:
+        entry["m0"] = {
+            "nodes": [
+                {
+                    "number": merged,
+                    "title": "A change",
+                    "url": f"https://github.com/acme/repo/pull/{merged}",
+                    "mergedAt": "2026-09-04T12:00:35Z",
+                },
+            ],
+        }
     for alias, state in (checks or {}).items():
         entry[alias] = {
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": state}}}]},
@@ -340,6 +356,24 @@ def test_the_remote_column_names_a_branch_behind_its_origin_copy(
     assert "behind origin/fix" in capsys.readouterr().out.splitlines()[1]
 
 
+def test_the_remote_column_reports_the_pr_that_merged_this_branch(
+    git_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    git(git_repo, "checkout", "-q", "-b", "fix")
+    gh = _RecordingGh(
+        {"api": _graphql("main", "f" * 40, merged=12), "search": "[]"},
+    )
+    board = _remote_board(git_repo.parent, gh)
+    board.rescan()
+    assert board.read_remote(force=True) is True
+
+    assert cmd_ls(board, None, now=NOW, remote=True) == 0
+
+    assert "PR #12 merged" in capsys.readouterr().out.splitlines()[1]
+
+
 def test_a_disabled_remote_config_makes_no_call(git_repo: Path) -> None:
     gh = _RecordingGh({})
     board = _board(git_repo.parent)
@@ -369,6 +403,7 @@ def test_json_always_carries_the_remote_object(
         "branch_sha": None,
         "branch_known": False,
         "behind_branch": False,
+        "branch_merged_pr": None,
         "prs_known": False,
         "prs": [],
         "review_prs_known": False,
