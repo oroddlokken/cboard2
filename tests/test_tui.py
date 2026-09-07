@@ -962,6 +962,54 @@ def test_pr_column_counts_drafts_apart() -> None:
     assert pr_text(_row("e")).plain == "?"
 
 
+def _column_width(app: CboardApp, label: str) -> int:
+    """Return the width the table holds for the column headed ``label``."""
+    column = list(_table(app).columns.values())[_COLUMNS.index(label)]
+    return column.content_width
+
+
+@pytest.mark.asyncio
+async def test_a_remote_read_widens_the_pr_column(tmp_path: Path) -> None:
+    """The table opens before the read, so the PR cell arrives wider than its column."""
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+    reviewed = RemoteState(review_prs_known=True, review_prs=(_pr(7),))
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("alpha", active_at=100.0)])
+        await pilot.pause()
+        unread = _column_width(app, "PR")
+
+        app.apply_rows([_row("alpha", active_at=100.0, remote=reviewed)])
+        await pilot.pause()
+        read = _column_width(app, "PR")
+        cell = str(_table(app).get_row_at(0)[_COLUMNS.index("PR")])
+
+    assert unread == len("PR")
+    assert cell == "1 to review"
+    assert read == len(cell)
+
+
+@pytest.mark.asyncio
+async def test_a_shorter_cell_leaves_the_column_width_alone(tmp_path: Path) -> None:
+    """A narrower cell must not send Textual over every cell in the column."""
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER)
+    reviewed = RemoteState(review_prs_known=True, review_prs=(_pr(7),))
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("alpha", active_at=100.0, remote=reviewed)])
+        await pilot.pause()
+        wide = _column_width(app, "PR")
+
+        app.apply_rows([_row("alpha", active_at=100.0)])
+        await pilot.pause()
+        narrowed = _column_width(app, "PR")
+
+    assert wide == len("1 to review")
+    assert narrowed == wide
+
+
 def test_behind_filter_keeps_only_repos_missing_the_remote_tip() -> None:
     rows = [
         _row("stale", remote=BEHIND),

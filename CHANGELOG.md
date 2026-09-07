@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A column stays as wide as its widest cell, so the PR column no longer reads `2` where it means `2 to review`.** The table is painted before the first remote read answers, when the PR cell is `?` and the column is as wide as its header. Textual grows an auto-width column when a row is added and leaves it alone when a cell is overwritten, so every reading after that first paint was cut to two characters until `r` rebuilt the table. Each repaint now asks for the width back, and only for a cell that grew: a narrower one sends Textual over every cell in the column, and the two age columns shorten on the poll.
+
 ## 0.2.0 (2026-09-06)
 
 ## 0.1.3 (2026-09-06)

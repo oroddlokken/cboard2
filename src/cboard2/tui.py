@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 from zlib import crc32
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -462,6 +463,20 @@ def fold_cells(fold: Fold) -> tuple[Text, ...]:
     return (Text(label, style="dim"), Text(action, style="dim"), *blanks)
 
 
+def column_widths(cells: Sequence[tuple[str, tuple[Text, ...]]]) -> list[int]:
+    """Return the width each column needs for ``cells``, header included.
+
+    Textual grows an auto-width column when a row is added and leaves it alone
+    when a cell is overwritten, so :meth:`TuiApp.write_changed` compares
+    against these to know when a cell no longer fits.
+    """
+    widths = [cell_len(label) for label in _COLUMNS]
+    for _, row in cells:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], cell_len(cell.plain))
+    return widths
+
+
 def _paint(cell: Text) -> tuple[str, str]:
     """Return what a cell shows, as the pair a repaint compares."""
     return cell.plain, str(cell.style)
@@ -856,6 +871,7 @@ class CboardApp(App[None]):
         self._sort = _SORTS[0]
         self._window_index = 0
         self._painted: Painted = {}
+        self._widths: list[int] = [cell_len(label) for label in _COLUMNS]
         self._screen_keys: tuple[str, ...] = ()
         self._reorder = True
         self._pulling: set[Path] = set()
@@ -1025,6 +1041,7 @@ class CboardApp(App[None]):
         table.clear()
         for key, row in cells:
             table.add_row(*row, key=key)
+        self._widths = column_widths(cells)
         restore_cursor(table, selected)
         table.scroll_to(offset.x, offset.y, animate=False)
 
@@ -1033,14 +1050,25 @@ class CboardApp(App[None]):
         table: DataTable[str | Text],
         cells: Sequence[tuple[str, tuple[Text, ...]]],
     ) -> None:
-        """Overwrite only the cells whose text differs from what was painted."""
+        """Overwrite only the cells whose text differs from what was painted.
+
+        A cell wider than its column asks for the width back: the table opens
+        before the first remote read, so ``PR`` starts at the width of ``?``
+        and every reading after it would be cut to one character. The ask is
+        limited to cells that grew, because a narrower one sends Textual over
+        every cell in the column, and the two age columns shorten on the poll.
+        """
         columns = list(table.columns)
         for key, row in cells:
             previous = self._painted.get(key)
             for index, cell in enumerate(row):
                 if previous is not None and previous[index] == _paint(cell):
                     continue
-                table.update_cell(key, columns[index], cell)
+                width = cell_len(cell.plain)
+                grew = width > self._widths[index]
+                if grew:
+                    self._widths[index] = width
+                table.update_cell(key, columns[index], cell, update_width=grew)
 
     def status_text(self, visible: int, folded: int = 0) -> str:
         """Describe what the table is showing, for the header's subtitle."""
