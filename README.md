@@ -55,10 +55,11 @@ work still sorts you to the top.
 | `t` | Window: all, 1h, 1d, 7d, 30d |
 | `D` | Toggle the selected repo dormant, and write that to the config file |
 | `P` | Check out the default branch and pull it |
+| `A` | The same pull for every visible repo the last remote read found behind, four at a time |
 | `r` `R` | Poll now; `R` also ignores the dormant interval |
 | `q` | Quit |
 
-`P` is the only key that writes to a repo. Everything else reads.
+`P` and `A` are the only keys that write to a repo. Everything else reads.
 
 ## Scripting
 

@@ -1382,6 +1382,165 @@ async def test_shift_p_on_an_empty_table_does_nothing(
     assert runs == []
 
 
+@pytest.mark.asyncio
+async def test_shift_a_pulls_every_visible_repo_that_is_behind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repo already at the remote tip is left alone, and so is an unread one."""
+    runs: list[Path] = []
+
+    def recording_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(
+            [
+                _row("one", remote=BEHIND),
+                _row("two", remote=BEHIND),
+                _row("fresh", remote=CURRENT),
+                _row("unread"),
+            ]
+        )
+        await pilot.pause()
+        _record_notes(app, notes, monkeypatch)
+
+        await pilot.press("A")
+        await _settle(app)
+        await pilot.pause()
+
+    assert sorted(path.name for path in runs) == ["one", "two"]
+    assert notes[0] == "pulling 2 repos…"
+
+
+@pytest.mark.asyncio
+async def test_shift_a_pulls_nothing_when_no_repo_is_behind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote read is what says a pull is worth making."""
+    runs: list[Path] = []
+
+    def recording_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("fresh", remote=CURRENT), _row("unread")])
+        await pilot.pause()
+        _record_notes(app, notes, monkeypatch)
+
+        await pilot.press("A")
+        await _settle(app)
+        await pilot.pause()
+
+    assert runs == []
+    assert notes == ["no visible repo is behind its remote"]
+
+
+@pytest.mark.asyncio
+async def test_shift_a_pulls_only_the_behind_rows_the_filters_show(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filter narrows the behind set further: ``d`` then ``A`` is one repo."""
+    runs: list[Path] = []
+
+    def recording_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows(
+            [_row("stale", remote=BEHIND), _row("busy", dirty=2, remote=BEHIND)]
+        )
+        await pilot.pause()
+
+        await pilot.press("d")
+        await pilot.press("A")
+        await _settle(app)
+        await pilot.pause()
+
+    assert [path.name for path in runs] == ["busy"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_shift_a_does_not_queue_a_repo_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    runs: list[Path] = []
+
+    def blocking_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        started.set()
+        release.wait(timeout=5.0)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", blocking_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("stale", remote=BEHIND)])
+        await pilot.pause()
+        _record_notes(app, notes, monkeypatch)
+
+        await pilot.press("A")
+        assert started.wait(timeout=5.0)
+        await pilot.press("A")
+        await pilot.pause()
+        second = list(notes)
+        release.set()
+        await _settle(app)
+
+    assert len(runs) == 1
+    assert "every repo behind its remote is already pulling" in second
+
+
+@pytest.mark.asyncio
+async def test_shift_a_on_an_empty_table_pulls_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[Path] = []
+
+    def recording_pull(root: Path, **_kwargs: object) -> Outcome:
+        runs.append(root)
+        return Outcome(ok=True, message="already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    notes: list[str] = []
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        _record_notes(app, notes, monkeypatch)
+        await pilot.press("A")
+        await pilot.pause()
+
+    assert runs == []
+    assert notes == ["no visible repo is behind its remote"]
+
+
 def test_name_order_puts_a_worktree_under_its_repo() -> None:
     rows = [
         _row("zulu"),

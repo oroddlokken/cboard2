@@ -842,6 +842,7 @@ class CboardApp(App[None]):
         Binding("p", "toggle_prs", "Open PRs"),
         Binding("slash", "open_filter", "Filter by name"),
         Binding("P", "pull_default", "Pull default"),
+        Binding("A", "pull_behind", "Pull behind"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("t", "cycle_window", "Window"),
         Binding("a", "open_activity", "Activity"),
@@ -1162,19 +1163,16 @@ class CboardApp(App[None]):
     def action_pull_default(self) -> None:
         """Check out the selected repo's default branch and pull it.
 
-        No prompt: this is the one key in the dashboard that writes to a repo,
-        and it runs on the row under the cursor.
+        No prompt: ``P`` and ``A`` are the two keys in the dashboard that write
+        to a repo, and this one runs on the row under the cursor.
         """
         row = self.selected_row()
         if row is None:
             return
-        path = row.state.path
-        if path in self._pulling:
+        if not self.queue_pull(row):
             self.notify(f"{row.state.name} is already pulling")
             return
 
-        self._pulling.add(path)
-        self._pull_queue.append((path, row.remote.default_branch))
         if len(self._pulls_running) >= _PULL_LIMIT:
             self.notify(
                 f"{row.state.name} is queued behind {len(self._pulls_running)} pulls"
@@ -1182,6 +1180,40 @@ class CboardApp(App[None]):
         else:
             self.notify(f"pulling {row.state.name}…")
         self.start_pulls()
+
+    def action_pull_behind(self) -> None:
+        """Pull the visible repos whose default branch is behind the remote.
+
+        ``behind_default`` is the same reading ``b`` filters on and the same
+        branch :func:`pull_default` checks out, so a repo it says nothing
+        about is left alone: a board whose remote reads are off or have not
+        landed yet pulls nothing rather than every repo it can see.
+        """
+        behind = [row for row in self.visible_rows() if row.remote.behind_default]
+        if not behind:
+            self.notify("no visible repo is behind its remote")
+            return
+
+        queued = [row for row in behind if self.queue_pull(row)]
+        if not queued:
+            self.notify("every repo behind its remote is already pulling")
+            return
+
+        self.notify(f"pulling {len(queued)} repos…")
+        self.start_pulls()
+
+    def queue_pull(self, row: Row) -> bool:
+        """Put ``row`` in the pull queue, or return False if it is in it already.
+
+        Two git processes in one repo fight over ``index.lock``, so a path
+        stays in ``self._pulling`` from here until :meth:`pulled` clears it.
+        """
+        path = row.state.path
+        if path in self._pulling:
+            return False
+        self._pulling.add(path)
+        self._pull_queue.append((path, row.remote.default_branch))
+        return True
 
     @work(thread=True, group="pull")
     def pull(self, path: Path, default_branch: str | None) -> None:
