@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.2.2 (2026-09-07)
+
 ### Added
 
 - **`A` pulls every visible repo the last remote read found behind, so one keypress brings the board up to date.** `P` pulls the row under the cursor, which meant one keypress per repo and a cursor move between each. `A` puts every visible row whose default branch is behind through the same queue, which already runs four pulls at a time and reports each one as it lands. A repo the remote read says nothing about is skipped, so a board with remote reads off pulls nothing rather than fetching every repo it can see.
