@@ -876,7 +876,7 @@ class CboardApp(App[None]):
         self._screen_keys: tuple[str, ...] = ()
         self._reorder = True
         self._pulling: set[Path] = set()
-        self._pull_queue: deque[tuple[Path, str | None]] = deque()
+        self._pull_queue: deque[tuple[Path, str | None, bool]] = deque()
         self._pull_steps: dict[Path, str] = {}
         self._pulls_running: set[Path] = set()
         self._expanded: set[Path] = set()
@@ -962,7 +962,7 @@ class CboardApp(App[None]):
         stops a second ``P`` on the same repo.
         """
         self._expanded &= {row.state.family for row in self._rows}
-        busy = self._pulls_running | {path for path, _ in self._pull_queue}
+        busy = self._pulls_running | {path for path, *_ in self._pull_queue}
         self._pulling &= {row.state.path for row in self._rows} | busy
 
     def visible_rows(self) -> list[Row]:
@@ -1169,7 +1169,7 @@ class CboardApp(App[None]):
         row = self.selected_row()
         if row is None:
             return
-        if not self.queue_pull(row):
+        if not self.queue_pull(row, move=True):
             self.notify(f"{row.state.name} is already pulling")
             return
 
@@ -1182,19 +1182,23 @@ class CboardApp(App[None]):
         self.start_pulls()
 
     def action_pull_behind(self) -> None:
-        """Pull the visible repos whose default branch is behind the remote.
+        """Bring the visible repos whose default branch is behind up to date.
 
-        ``behind_default`` is the same reading ``b`` filters on and the same
-        branch :func:`pull_default` checks out, so a repo it says nothing
-        about is left alone: a board whose remote reads are off or have not
-        landed yet pulls nothing rather than every repo it can see.
+        ``behind_default`` is the same reading ``b`` filters on, so a repo it
+        says nothing about is left alone: a board whose remote reads are off or
+        have not landed yet pulls nothing rather than every repo it can see.
+
+        The checkout is left alone (``move=False``). ``behind_default`` is
+        about the default branch and not about whatever is checked out, so this
+        key used to walk a screenful of repos off the branch the user was
+        standing on, open pull request and all.
         """
         behind = [row for row in self.visible_rows() if row.remote.behind_default]
         if not behind:
             self.notify("no visible repo is behind its remote")
             return
 
-        queued = [row for row in behind if self.queue_pull(row)]
+        queued = [row for row in behind if self.queue_pull(row, move=False)]
         if not queued:
             self.notify("every repo behind its remote is already pulling")
             return
@@ -1202,21 +1206,25 @@ class CboardApp(App[None]):
         self.notify(f"pulling {len(queued)} repos…")
         self.start_pulls()
 
-    def queue_pull(self, row: Row) -> bool:
+    def queue_pull(self, row: Row, *, move: bool) -> bool:
         """Put ``row`` in the pull queue, or return False if it is in it already.
 
         Two git processes in one repo fight over ``index.lock``, so a path
         stays in ``self._pulling`` from here until :meth:`pulled` clears it.
+
+        ``move`` rides along per queued repo rather than being read at the
+        worker, because ``P`` and ``A`` share the queue and ask for different
+        things from the same path.
         """
         path = row.state.path
         if path in self._pulling:
             return False
         self._pulling.add(path)
-        self._pull_queue.append((path, row.remote.default_branch))
+        self._pull_queue.append((path, row.remote.default_branch, move))
         return True
 
     @work(thread=True, group="pull")
-    def pull(self, path: Path, default_branch: str | None) -> None:
+    def pull(self, path: Path, default_branch: str | None, *, move: bool) -> None:
         """Run the pull off the UI thread, then hand the outcome back.
 
         Not exclusive: pulling two repos one after the other should finish
@@ -1231,6 +1239,7 @@ class CboardApp(App[None]):
             outcome = pull_default(
                 path,
                 default_branch=default_branch,
+                move=move,
                 on_step=lambda step: self.call_from_thread(self.pull_step, path, step),
             )
         except Exception as exc:  # noqa: BLE001
@@ -1245,9 +1254,9 @@ class CboardApp(App[None]):
         a key action or as the callback a finished worker marshals back.
         """
         while self._pull_queue and len(self._pulls_running) < _PULL_LIMIT:
-            path, branch = self._pull_queue.popleft()
+            path, branch, move = self._pull_queue.popleft()
             self._pulls_running.add(path)
-            self.pull(path, branch)
+            self.pull(path, branch, move=move)
 
     def pull_step(self, path: Path, step: str) -> None:
         """Name the git step ``path`` has reached, in the header subtitle.

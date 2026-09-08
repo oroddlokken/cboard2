@@ -55,7 +55,7 @@ work still sorts you to the top.
 | `t` | Window: all, 1h, 1d, 7d, 30d |
 | `D` | Toggle the selected repo dormant, and write that to the config file |
 | `P` | Check out the default branch and pull it |
-| `A` | The same pull for every visible repo the last remote read found behind, four at a time |
+| `A` | Bring every visible repo the last remote read found behind up to date, four at a time. A repo standing on another branch keeps its checkout: only its default branch moves |
 | `r` `R` | Poll now; `R` also ignores the dormant interval |
 | `q` | Quit |
 

@@ -10,9 +10,14 @@ reliable. GitHub's answer is best and cboard2 usually holds it already.
 never refreshed, so a renamed default branch leaves it pointing at a ref that
 is gone — hence the repair step. ``main`` and ``master`` are the last resort.
 
+A caller passing ``move=False`` gets the second path: where the default branch
+is not the one checked out, ``git fetch origin main:main`` moves that ref alone
+and HEAD stays where the user left it. The dashboard's ``A`` takes it, because
+one keypress there covers every visible repo.
+
 One :func:`pull_default` waits at most 420s: a 60s fetch, then a 180s checkout
-and a 180s pull. The other calls read local refs and answer in milliseconds.
-Callers pass ``on_step`` to hear which of the three is running.
+and a 180s pull. The refspec fetch waits 60s. The other calls read local refs
+and answer in milliseconds. Callers pass ``on_step`` to hear which is running.
 """
 
 from __future__ import annotations
@@ -47,6 +52,9 @@ _STEP_TIMEOUTS = MappingProxyType({"fetch": FETCH_TIMEOUT})
 
 CANDIDATE_BRANCHES = ("main", "master")
 """Tried in order when neither GitHub nor ``origin/HEAD`` names the branch."""
+
+ORIGIN = "origin"
+"""The remote every fetch here names. cboard2 reads no other."""
 
 _PULL_ENV = {"GIT_TERMINAL_PROMPT": "0"}
 """Keeps a fetch that wants credentials from hanging the worker forever."""
@@ -105,6 +113,7 @@ def pull_default(
     root: Path,
     *,
     default_branch: str | None = None,
+    move: bool = True,
     runner: StepRunner = run_step,
     on_step: StepReport = lambda _step: None,
 ) -> Outcome:
@@ -113,11 +122,21 @@ def pull_default(
     ``default_branch`` is GitHub's answer where cboard2 has one, which skips
     the guessing entirely.
 
+    ``move`` False leaves the checkout alone: a repo standing on another branch
+    gets its default branch fast-forwarded through a refspec instead. The
+    dashboard's ``A`` pulls a screenful of repos on one keypress, and the
+    branch a user is standing on is often one with an open pull request.
+
     ``on_step`` is handed each step's name as it starts, so a caller waiting
     minutes on a slow origin can say which of the three is holding.
     """
     if not runner(root, ("rev-parse", "--git-dir")).ok:
         return Outcome(ok=False, message="not a git repository")
+
+    if not move:
+        aside = _fast_forward(root, default_branch, runner, on_step)
+        if aside is not None:
+            return aside
 
     on_step("fetching")
     fetched = runner(root, ("fetch", "--prune"))
@@ -136,6 +155,68 @@ def pull_default(
         return moved
 
     return _pull(root, branch, runner, on_step)
+
+
+def _fast_forward(
+    root: Path,
+    default_branch: str | None,
+    runner: StepRunner,
+    on_step: StepReport,
+) -> Outcome | None:
+    """Move the default branch to the origin's tip, leaving the checkout where it is.
+
+    None means this repo needs the checkout-and-pull path after all: the
+    default branch is the one checked out, or nothing here names it.
+
+    ``git fetch origin main:main`` writes that one ref and touches neither HEAD
+    nor the working tree. Git refuses the refspec when the update is not a
+    fast-forward, and when another worktree of this repo has the branch checked
+    out, so a repo that cannot take the update reports git's own complaint
+    rather than having its branch rewritten.
+    """
+    branch = default_branch or find_default_branch(root, runner)
+    if branch is None:
+        return None
+    current = runner(root, ("symbolic-ref", "--short", "HEAD"))
+    if current.ok and current.out.strip() == branch:
+        return None
+
+    before = _ref_sha(root, branch, runner)
+    on_step(f"fetching {branch}")
+    step = runner(root, ("fetch", "--prune", ORIGIN, f"{branch}:{branch}"))
+    if not step.ok:
+        return Outcome(
+            ok=False,
+            message=_reason(f"could not fast-forward {branch}", step),
+            branch=branch,
+        )
+
+    where = current.out.strip() if current.ok else "a detached HEAD"
+    return Outcome(
+        ok=True,
+        message=f"{_arrived(root, branch, before, runner)}, still on {where}",
+        branch=branch,
+    )
+
+
+def _arrived(root: Path, branch: str, before: str | None, runner: StepRunner) -> str:
+    """Say how far ``branch`` moved, counted from the sha it stood on."""
+    after = _ref_sha(root, branch, runner)
+    if after is None or after == before:
+        return f"{branch} already up to date"
+    if before is None:
+        return f"fetched {branch}"
+    counted = runner(root, ("rev-list", "--count", f"{before}..{after}")).out.strip()
+    if not counted.isdigit() or counted == "0":
+        return f"fast-forwarded {branch}"
+    plural = "" if counted == "1" else "s"
+    return f"fast-forwarded {branch} by {counted} commit{plural}"
+
+
+def _ref_sha(root: Path, branch: str, runner: StepRunner) -> str | None:
+    """Return the sha of the local ``branch``, or None when it has none here."""
+    step = runner(root, ("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"))
+    return step.out.strip() or None if step.ok else None
 
 
 def find_default_branch(root: Path, runner: StepRunner) -> str | None:

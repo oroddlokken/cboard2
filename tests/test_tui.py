@@ -1420,6 +1420,62 @@ async def test_shift_a_pulls_every_visible_repo_that_is_behind(
 
 
 @pytest.mark.asyncio
+async def test_shift_a_leaves_the_checkout_where_it_is(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``behind_default`` is about the default branch, not about the checkout."""
+    moves: list[bool] = []
+
+    def recording_pull(root: Path, *, move: bool = True, **_kwargs: object) -> Outcome:
+        assert root is not None
+        moves.append(move)
+        return Outcome(ok=True, message="main already up to date", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("one", remote=BEHIND), _row("two", remote=BEHIND)])
+        await pilot.pause()
+
+        await pilot.press("A")
+        await _settle(app)
+        await pilot.pause()
+
+    assert moves == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_shift_p_still_checks_out_the_default_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One row under the cursor is a repo the user named, so the checkout moves."""
+    moves: list[bool] = []
+
+    def recording_pull(root: Path, *, move: bool = True, **_kwargs: object) -> Outcome:
+        assert root is not None
+        moves.append(move)
+        return Outcome(ok=True, message="pulled 1 commit", branch="main")
+
+    monkeypatch.setattr("cboard2.tui.pull_default", recording_pull)
+    app = CboardApp(_board(tmp_path), refresh_interval=NEVER, clock=lambda: 0.0)
+
+    async with app.run_test() as pilot:
+        await _settle(app)
+        app.apply_rows([_row("one", remote=BEHIND)])
+        await pilot.pause()
+
+        await pilot.press("P")
+        await _settle(app)
+        await pilot.pause()
+
+    assert moves == [True]
+
+
+@pytest.mark.asyncio
 async def test_shift_a_pulls_nothing_when_no_repo_is_behind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

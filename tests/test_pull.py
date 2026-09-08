@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from conftest import git
 
 from cboard2.pull import (
     FETCH_TIMEOUT,
@@ -469,3 +470,133 @@ def test_the_fetch_gets_a_shorter_timeout_than_the_steps_after_it(
 
     assert FETCH_TIMEOUT < PULL_TIMEOUT
     assert seen == [FETCH_TIMEOUT, PULL_TIMEOUT]
+
+
+def _cloned(tmp_path: Path) -> tuple[Path, Path]:
+    """Return an origin repo holding two commits and a clone one commit behind."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(origin, "init", "-b", "main", "-q")
+    (origin / "one.txt").write_text("one\n", encoding="utf-8")
+    git(origin, "add", "one.txt")
+    git(origin, "commit", "-qm", "First")
+
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(origin), str(clone))
+
+    (origin / "two.txt").write_text("two\n", encoding="utf-8")
+    git(origin, "add", "two.txt")
+    git(origin, "commit", "-qm", "Second")
+    return origin, clone
+
+
+def test_move_false_fast_forwards_main_without_leaving_the_feature_branch(
+    tmp_path: Path,
+) -> None:
+    """The board's ``A`` covers a screenful of repos, so it moves no checkout."""
+    _origin, clone = _cloned(tmp_path)
+    git(clone, "checkout", "-qb", "feat/x")
+    before = git(clone, "rev-parse", "main").strip()
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is True
+    assert outcome.message == "fast-forwarded main by 1 commit, still on feat/x"
+    assert git(clone, "symbolic-ref", "--short", "HEAD").strip() == "feat/x"
+    assert git(clone, "rev-parse", "main").strip() != before
+    assert (
+        git(clone, "rev-parse", "main").strip()
+        == git(clone, "rev-parse", "origin/main").strip()
+    )
+
+
+def test_move_false_on_the_default_branch_still_checks_out_and_pulls(
+    tmp_path: Path,
+) -> None:
+    """A refspec cannot write the branch that is checked out, so the pull runs."""
+    _origin, clone = _cloned(tmp_path)
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is True
+    assert outcome.message == "pulled 1 commit"
+    assert git(clone, "symbolic-ref", "--short", "HEAD").strip() == "main"
+    assert (
+        git(clone, "rev-parse", "main").strip()
+        == git(clone, "rev-parse", "origin/main").strip()
+    )
+
+
+def test_move_false_reports_a_diverged_default_branch_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Git refuses a refspec that is not a fast-forward, and the ref stays put."""
+    _origin, clone = _cloned(tmp_path)
+    (clone / "mine.txt").write_text("mine\n", encoding="utf-8")
+    git(clone, "add", "mine.txt")
+    git(clone, "commit", "-qm", "Local only")
+    git(clone, "checkout", "-qb", "feat/x")
+    before = git(clone, "rev-parse", "main").strip()
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is False
+    assert outcome.branch == "main"
+    assert outcome.message.startswith("could not fast-forward main")
+    assert git(clone, "rev-parse", "main").strip() == before
+    assert git(clone, "symbolic-ref", "--short", "HEAD").strip() == "feat/x"
+
+
+def test_move_false_names_the_step_it_is_running(tmp_path: Path) -> None:
+    _origin, clone = _cloned(tmp_path)
+    git(clone, "checkout", "-qb", "feat/x")
+    steps: list[str] = []
+
+    pull_default(clone, default_branch="main", move=False, on_step=steps.append)
+
+    assert steps == ["fetching main"]
+
+
+def test_move_false_on_a_detached_head_fast_forwards_and_says_so(
+    tmp_path: Path,
+) -> None:
+    _origin, clone = _cloned(tmp_path)
+    git(clone, "checkout", "-q", "--detach", "HEAD")
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is True
+    assert outcome.message == (
+        "fast-forwarded main by 1 commit, still on a detached HEAD"
+    )
+
+
+def test_move_false_reports_a_default_branch_already_at_the_tip(
+    tmp_path: Path,
+) -> None:
+    _origin, clone = _cloned(tmp_path)
+    git(clone, "checkout", "-qb", "feat/x")
+    pull_default(clone, default_branch="main", move=False)
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is True
+    assert outcome.message == "main already up to date, still on feat/x"
+
+
+def test_move_false_falls_back_to_the_pull_when_no_branch_is_named(
+    tmp_path: Path,
+) -> None:
+    """Nothing names the default branch, so the checkout-and-pull path answers."""
+    fake = FakeGit(
+        {
+            ("rev-parse", "--git-dir"): _out(".git"),
+            ("fetch", "--prune"): OK,
+        },
+    )
+
+    outcome = pull_default(tmp_path, move=False, runner=fake)
+
+    assert outcome.ok is False
+    assert outcome.message == "no default branch found: no origin/HEAD, main or master"
+    assert not fake.ran("fetch", "--prune", "origin")

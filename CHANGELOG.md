@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`A` no longer walks a screenful of repos off the branch they are standing on.** The behind marker is about the default branch, not about the checkout, so `A` reached repos sitting on a feature branch with an open pull request and checked them out onto `main`. Where the default branch is not the one checked out, `A` now runs `git fetch origin main:main`: the local `main` moves, HEAD and the working tree stay. Git refuses that refspec when the update is not a fast-forward, so a diverged `main` reports the refusal instead of being rewritten. `P` is unchanged — it names one repo the user picked, and checking it out is what they asked for.
+
 ## 0.2.2 (2026-09-07)
 
 ### Added
