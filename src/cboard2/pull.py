@@ -25,12 +25,12 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from pathlib import Path
 
     type StepRunner = Callable[[Path, Sequence[str]], Step]
     type StepReport = Callable[[str], None]
@@ -170,9 +170,12 @@ def _fast_forward(
 
     ``git fetch origin main:main`` writes that one ref and touches neither HEAD
     nor the working tree. Git refuses the refspec when the update is not a
-    fast-forward, and when another worktree of this repo has the branch checked
-    out, so a repo that cannot take the update reports git's own complaint
-    rather than having its branch rewritten.
+    fast-forward, so a repo that cannot take the update reports git's own
+    complaint rather than having its branch rewritten.
+
+    Git also refuses it when any other worktree of the repo has the branch
+    checked out. That worktree is a row of its own on the board and pulls the
+    branch itself, so this one says so and skips the fetch.
     """
     branch = default_branch or find_default_branch(root, runner)
     if branch is None:
@@ -180,6 +183,14 @@ def _fast_forward(
     current = runner(root, ("symbolic-ref", "--short", "HEAD"))
     if current.ok and current.out.strip() == branch:
         return None
+
+    holder = _worktree_holding(root, branch, runner)
+    if holder is not None:
+        return Outcome(
+            ok=True,
+            message=f"{branch} is checked out in {holder.name}, pulled from there",
+            branch=branch,
+        )
 
     before = _ref_sha(root, branch, runner)
     on_step(f"fetching {branch}")
@@ -197,6 +208,25 @@ def _fast_forward(
         message=f"{_arrived(root, branch, before, runner)}, still on {where}",
         branch=branch,
     )
+
+
+def _worktree_holding(root: Path, branch: str, runner: StepRunner) -> Path | None:
+    """Return the worktree that has ``branch`` checked out, or None.
+
+    Called after the checkout here is known not to be ``branch``, so any
+    worktree the listing names is another one. The porcelain listing is one
+    ``worktree <path>`` line per entry, followed by its ``branch`` line.
+    """
+    listed = runner(root, ("worktree", "list", "--porcelain"))
+    if not listed.ok:
+        return None
+    where: str | None = None
+    for line in listed.out.splitlines():
+        if line.startswith("worktree "):
+            where = line.removeprefix("worktree ")
+        elif line == f"branch refs/heads/{branch}" and where is not None:
+            return Path(where)
+    return None
 
 
 def _arrived(root: Path, branch: str, before: str | None, runner: StepRunner) -> str:

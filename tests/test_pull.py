@@ -547,6 +547,59 @@ def test_move_false_reports_a_diverged_default_branch_and_writes_nothing(
     assert git(clone, "symbolic-ref", "--short", "HEAD").strip() == "feat/x"
 
 
+def test_move_false_leaves_main_to_the_worktree_that_holds_it(
+    tmp_path: Path,
+) -> None:
+    """Git refuses the refspec while a sibling worktree is on the branch.
+
+    That sibling is a row of its own, so this row says so instead of
+    reporting the refusal, and the sibling's own pull brings main to the tip.
+    """
+    _origin, clone = _cloned(tmp_path)
+    git(clone, "checkout", "-qb", "feat/x")
+    side = tmp_path / "side"
+    git(clone, "worktree", "add", "-q", str(side), "main")
+    before = git(clone, "rev-parse", "main").strip()
+
+    outcome = pull_default(clone, default_branch="main", move=False)
+
+    assert outcome.ok is True
+    assert outcome.branch == "main"
+    assert outcome.message == "main is checked out in side, pulled from there"
+    assert git(clone, "rev-parse", "main").strip() == before
+
+    sibling = pull_default(side, default_branch="main", move=False)
+
+    assert sibling.ok is True
+    assert sibling.message == "pulled 1 commit"
+    assert (
+        git(clone, "rev-parse", "main").strip()
+        == git(clone, "rev-parse", "origin/main").strip()
+    )
+
+
+def test_move_false_skips_the_fetch_when_a_worktree_holds_the_branch(
+    tmp_path: Path,
+) -> None:
+    listing = (
+        "worktree /repo\nHEAD aaaa\nbranch refs/heads/feat/x\n\n"
+        "worktree /repo-main\nHEAD bbbb\nbranch refs/heads/main\n\n"
+    )
+    fake = FakeGit(
+        {
+            ("rev-parse", "--git-dir"): _out(".git"),
+            _HEAD: _out("feat/x"),
+            ("worktree", "list", "--porcelain"): _out(listing),
+        },
+    )
+
+    outcome = pull_default(tmp_path, default_branch="main", move=False, runner=fake)
+
+    assert outcome.ok is True
+    assert outcome.message == "main is checked out in repo-main, pulled from there"
+    assert not fake.ran("fetch")
+
+
 def test_move_false_names_the_step_it_is_running(tmp_path: Path) -> None:
     _origin, clone = _cloned(tmp_path)
     git(clone, "checkout", "-qb", "feat/x")
