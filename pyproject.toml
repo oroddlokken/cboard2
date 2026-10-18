@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Software Development :: Version Control :: Git",
 ]
 dependencies = [
-    "textual>=6.4.0",
+    "textual>=8.2.8",
 ]
 
 [project.urls]
