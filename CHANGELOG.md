@@ -10,6 +10,10 @@
 
 - **The Homebrew formula runs on `python@3.14`, the interpreter `dogcat` already uses.** With `python@3.13` and `python@3.14` both installed, each patch release of either left its unbottled dependents outdated, and `brew upgrade` skipped them with a warning. One interpreter means one `brew reinstall` after a bump covers all three tools. `requires-python` stays `>=3.13`.
 
+### Development
+
+- **Dependencies move to latest: ruff 0.17.1 and pyright 1.1.414.**
+
 ## 0.2.2 (2026-09-07)
 
 ### Added
